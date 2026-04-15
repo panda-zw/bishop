@@ -1,0 +1,2353 @@
+#!/bin/bash
+# =============================================================================
+# Deploy CLI — single entry point for all deployment operations
+#
+# Usage:
+#   ./deploy                       Interactive setup (walks you through everything)
+#   ./deploy <environment>         Deploy to environment
+#   ./deploy <command> <env>       Run a specific command
+#
+# Commands:
+#   init                              Full interactive setup (server + app + remote)
+#   setup-server <env>                Set up shared infrastructure on server
+#   setup-app <env>                   Set up app on server (DB, .env, etc.)
+#   <env>                             Deploy the app
+#   logs <env>                        Tail app logs
+#   status <env>                      Show running containers
+#   ssh <env>                         Open SSH session to server
+#
+# Remote format (.deploy/remotes/<env>):
+#   user@host:app-name.domain
+# =============================================================================
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+ask()   { echo -e "${CYAN}[?]${NC} $1"; }
+
+SCRIPT_DIR="${DEPLOY_PROJECT_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
+DEPLOY_DIR="${SCRIPT_DIR}/.deploy/infra"
+REMOTES_DIR="${SCRIPT_DIR}/.deploy/remotes"
+CACHE_DIR="${SCRIPT_DIR}/.deploy/cache"
+CONFIG_FILE="${SCRIPT_DIR}/.deploy/config"
+
+# ---------------------------------------------------------------------------
+# Load project config (with defaults)
+# ---------------------------------------------------------------------------
+
+HEALTH_PATH="/health"
+APP_PORT=3000
+HEALTH_MATCH="ok"
+EXTRA_CONTAINERS=""
+DATA_DIRS=""
+AUTO_SECRETS=""
+DOMAIN_TEMPLATES=""
+
+if [ -f "$CONFIG_FILE" ]; then
+  set -a; source "$CONFIG_FILE"; set +a
+fi
+
+# ---------------------------------------------------------------------------
+# Project config setup wizard
+# ---------------------------------------------------------------------------
+
+cmd_setup_project() {
+  echo ""
+  echo -e "${BOLD}=== Project Configuration ===${NC}"
+  echo ""
+  echo "  This creates .deploy/config for your project."
+  echo "  It tells the deploy script how your app works."
+  echo ""
+
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+
+  # --- App port ---
+  echo -e "${BOLD}1. App Port${NC}"
+  echo "  What port does your app listen on inside the container?"
+  echo ""
+  local port
+  port=$(prompt_default "App port" "${APP_PORT}")
+
+  # --- Health check ---
+  echo ""
+  echo -e "${BOLD}2. Health Check${NC}"
+  echo "  What endpoint should we hit to verify the app is running?"
+  echo ""
+  local health
+  health=$(prompt_default "Health check path" "${HEALTH_PATH}")
+
+  echo ""
+  echo "  What string in the response means it's healthy?"
+  echo "  (e.g., \"ok\", \"healthy\", \"<html\" for frontend)"
+  echo ""
+  local match
+  match=$(prompt_default "Health match pattern" "${HEALTH_MATCH}")
+
+  # --- Docker compose services ---
+  echo ""
+  echo -e "${BOLD}3. Compose Services${NC}"
+  echo "  Besides the main app container, what other services does your"
+  echo "  docker-compose have? (space-separated, e.g., minio redis-worker)"
+  echo "  Leave empty if your compose only has the app."
+  echo ""
+  local extra
+  extra=$(prompt_default "Extra containers" "${EXTRA_CONTAINERS}")
+
+  # --- Data directories ---
+  echo ""
+  echo -e "${BOLD}4. Persistent Data${NC}"
+  echo "  What directories should be created on the server for persistent data?"
+  echo "  (relative paths, space-separated, e.g., uploads minio onlyoffice/data)"
+  echo "  Leave empty if no persistent data beyond the database."
+  echo ""
+  local data
+  data=$(prompt_default "Data directories" "${DATA_DIRS}")
+
+  # --- Secret keys ---
+  echo ""
+  echo -e "${BOLD}5. Auto-Generated Secrets${NC}"
+  echo "  Which .env keys should get random values during setup?"
+  echo "  (space-separated, e.g., JWT_SECRET API_KEY ENCRYPTION_KEY)"
+  echo ""
+
+  # Try to auto-detect from .env.example
+  local suggested_secrets=""
+  local env_file=""
+  if [ -f "${DEPLOY_DIR}/.env.example" ]; then
+    env_file="${DEPLOY_DIR}/.env.example"
+  elif [ -f "${SCRIPT_DIR}/.env.example" ]; then
+    env_file="${SCRIPT_DIR}/.env.example"
+  fi
+
+  if [ -n "$env_file" ]; then
+    # Find keys with CHANGE_ME or common secret patterns
+    suggested_secrets=$(grep -E '^[A-Z_]+=.*CHANGE_ME|^(JWT_|.*SECRET|.*KEY|.*PASSWORD)=' "$env_file" 2>/dev/null \
+      | grep -v '^#' \
+      | grep -v 'DB_PASSWORD\|REDIS_PASSWORD' \
+      | cut -d'=' -f1 \
+      | tr '\n' ' ')
+    if [ -n "$suggested_secrets" ]; then
+      info "Detected from .env.example: ${suggested_secrets}"
+    fi
+  fi
+
+  local secrets
+  secrets=$(prompt_default "Secret keys to auto-generate" "${AUTO_SECRETS:-$suggested_secrets}")
+
+  # --- Domain templates ---
+  echo ""
+  echo -e "${BOLD}6. Domain-Dependent Values${NC}"
+  echo "  Some .env values depend on the domain (e.g., callback URLs)."
+  echo "  Format: KEY=https://\${DOMAIN}/path (space-separated)"
+  echo "  Leave empty if none."
+  echo ""
+
+  local templates
+  templates=$(prompt_default "Domain templates" "${DOMAIN_TEMPLATES}")
+
+  # --- Write config ---
+  echo ""
+  info "Saving .deploy/config..."
+
+  cat > "$CONFIG_FILE" <<EOF
+# =============================================================================
+# Deploy CLI — Project Configuration
+# Generated by ./deploy setup-project
+# =============================================================================
+
+# App port inside the container
+APP_PORT=${port}
+
+# Health check endpoint (relative to app root)
+HEALTH_PATH="${health}"
+
+# Health check match string (grep pattern to verify healthy response)
+HEALTH_MATCH="${match}"
+
+# Extra containers to check (space-separated, besides \${APP_NAME}-app)
+EXTRA_CONTAINERS="${extra}"
+
+# Data directories to create (relative to /mnt/data/apps/\${APP_NAME}/)
+DATA_DIRS="${data}"
+
+# Secret keys to auto-generate in .env (space-separated)
+AUTO_SECRETS="${secrets}"
+
+# Domain-dependent values (KEY=template pairs, \${DOMAIN} is replaced)
+DOMAIN_TEMPLATES="${templates}"
+EOF
+
+  # Reload config
+  set -a; source "$CONFIG_FILE"; set +a
+
+  # --- Docker setup ---
+  echo ""
+  echo -e "${BOLD}7. Docker Setup${NC}"
+  echo ""
+
+  if [ -f "${SCRIPT_DIR}/Dockerfile" ]; then
+    info "Dockerfile found — skipping generation"
+  else
+    warn "No Dockerfile found in project root."
+    if confirm "Generate a Dockerfile?"; then
+      generate_dockerfile
+    fi
+  fi
+
+  if [ -f "${DEPLOY_DIR}/docker-compose.prod.yml" ]; then
+    info "docker-compose.prod.yml found — skipping generation"
+  else
+    warn "No docker-compose.prod.yml found."
+    if confirm "Generate a production docker-compose?"; then
+      mkdir -p "$DEPLOY_DIR"
+      generate_compose "$port" "$extra"
+    fi
+  fi
+
+  # --- .env.example ---
+  if [ ! -f "${DEPLOY_DIR}/.env.example" ] && [ ! -f "${SCRIPT_DIR}/.env.example" ]; then
+    warn "No .env.example found."
+    if confirm "Generate a starter .env.example?"; then
+      generate_env_example "$port"
+    fi
+  fi
+
+  echo ""
+  echo -e "${GREEN}${BOLD}Project configured!${NC}"
+  echo ""
+  echo "  Config:          .deploy/config"
+  [ -f "${SCRIPT_DIR}/Dockerfile" ] && echo "  Dockerfile:      Dockerfile"
+  [ -f "${DEPLOY_DIR}/docker-compose.prod.yml" ] && echo "  Compose:         .deploy/infra/docker-compose.prod.yml"
+  echo ""
+  echo "  Edit these anytime to adjust settings."
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Docker file generators
+# ---------------------------------------------------------------------------
+
+detect_project_type() {
+  if [ -f "${SCRIPT_DIR}/package.json" ]; then
+    if grep -q '"next"' "${SCRIPT_DIR}/package.json" 2>/dev/null; then
+      echo "nextjs"
+    elif grep -q '"nuxt"' "${SCRIPT_DIR}/package.json" 2>/dev/null; then
+      echo "nuxt"
+    elif grep -q '"@nestjs/core"' "${SCRIPT_DIR}/package.json" 2>/dev/null; then
+      echo "nestjs"
+    elif grep -q '"express"' "${SCRIPT_DIR}/package.json" 2>/dev/null; then
+      echo "node-express"
+    elif grep -q '"react-scripts"\|"vite"' "${SCRIPT_DIR}/package.json" 2>/dev/null; then
+      echo "react-spa"
+    else
+      echo "node"
+    fi
+  elif [ -f "${SCRIPT_DIR}/requirements.txt" ] || [ -f "${SCRIPT_DIR}/pyproject.toml" ]; then
+    if grep -qE 'django|Django' "${SCRIPT_DIR}/requirements.txt" 2>/dev/null || \
+       grep -qE 'django|Django' "${SCRIPT_DIR}/pyproject.toml" 2>/dev/null; then
+      echo "django"
+    elif grep -qE 'fastapi|FastAPI' "${SCRIPT_DIR}/requirements.txt" 2>/dev/null || \
+         grep -qE 'fastapi|FastAPI' "${SCRIPT_DIR}/pyproject.toml" 2>/dev/null; then
+      echo "fastapi"
+    elif grep -qE 'flask|Flask' "${SCRIPT_DIR}/requirements.txt" 2>/dev/null || \
+         grep -qE 'flask|Flask' "${SCRIPT_DIR}/pyproject.toml" 2>/dev/null; then
+      echo "flask"
+    else
+      echo "python"
+    fi
+  elif [ -f "${SCRIPT_DIR}/go.mod" ]; then
+    echo "go"
+  elif [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
+    echo "rust"
+  elif [ -f "${SCRIPT_DIR}/Gemfile" ]; then
+    echo "rails"
+  else
+    echo "unknown"
+  fi
+}
+
+detect_package_manager() {
+  if [ -f "${SCRIPT_DIR}/pnpm-lock.yaml" ]; then
+    echo "pnpm"
+  elif [ -f "${SCRIPT_DIR}/yarn.lock" ]; then
+    echo "yarn"
+  elif [ -f "${SCRIPT_DIR}/bun.lockb" ] || [ -f "${SCRIPT_DIR}/bun.lock" ]; then
+    echo "bun"
+  else
+    echo "npm"
+  fi
+}
+
+generate_dockerfile() {
+  local project_type
+  project_type=$(detect_project_type)
+  info "Detected project type: ${project_type}"
+
+  case "$project_type" in
+    nestjs|node-express|node)
+      generate_dockerfile_node "$project_type"
+      ;;
+    nextjs)
+      generate_dockerfile_nextjs
+      ;;
+    react-spa)
+      generate_dockerfile_react_spa
+      ;;
+    django|fastapi|flask|python)
+      generate_dockerfile_python "$project_type"
+      ;;
+    go)
+      generate_dockerfile_go
+      ;;
+    *)
+      warn "Unknown project type. Generating a basic Node.js Dockerfile."
+      warn "Edit the Dockerfile to match your project."
+      generate_dockerfile_node "node"
+      ;;
+  esac
+
+  info "Generated Dockerfile"
+}
+
+generate_dockerfile_node() {
+  local project_type="$1"
+  local pm=$(detect_package_manager)
+  local install_cmd="npm ci"
+  local build_cmd="npm run build"
+  local start_cmd="node dist/main.js"
+  local pm_setup=""
+
+  case "$pm" in
+    pnpm)
+      pm_setup="RUN corepack enable && corepack prepare pnpm@latest --activate"
+      install_cmd="pnpm install --frozen-lockfile"
+      build_cmd="pnpm build"
+      ;;
+    yarn)
+      install_cmd="yarn install --frozen-lockfile"
+      build_cmd="yarn build"
+      ;;
+    bun)
+      pm_setup=""
+      install_cmd="bun install --frozen-lockfile"
+      build_cmd="bun run build"
+      ;;
+  esac
+
+  if [ "$project_type" = "nestjs" ]; then
+    start_cmd="node dist/main.js"
+  elif [ "$project_type" = "node-express" ]; then
+    start_cmd="node dist/index.js"
+  fi
+
+  local copy_lockfile=""
+  case "$pm" in
+    pnpm) copy_lockfile="COPY package.json pnpm-lock.yaml ./" ;;
+    yarn) copy_lockfile="COPY package.json yarn.lock ./" ;;
+    bun)  copy_lockfile="COPY package.json bun.lockb ./" ;;
+    *)    copy_lockfile="COPY package.json package-lock.json ./" ;;
+  esac
+
+  local base_image="node:22-alpine"
+  if [ "$pm" = "bun" ]; then
+    base_image="oven/bun:1-alpine"
+  fi
+
+  cat > "${SCRIPT_DIR}/Dockerfile" <<EOF
+# --- Build stage ---
+FROM ${base_image} AS build
+${pm_setup}
+WORKDIR /app
+${copy_lockfile}
+RUN ${install_cmd}
+COPY . .
+RUN ${build_cmd}
+
+# --- Production stage ---
+FROM ${base_image} AS production
+${pm_setup}
+WORKDIR /app
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/package.json ./
+EXPOSE ${APP_PORT}
+CMD ["${start_cmd%% *}", "$(echo "$start_cmd" | cut -d' ' -f2-)"]
+EOF
+}
+
+generate_dockerfile_nextjs() {
+  local pm=$(detect_package_manager)
+  local install_cmd="npm ci"
+  local build_cmd="npm run build"
+  local pm_setup=""
+
+  case "$pm" in
+    pnpm)
+      pm_setup="RUN corepack enable && corepack prepare pnpm@latest --activate"
+      install_cmd="pnpm install --frozen-lockfile"
+      build_cmd="pnpm build"
+      ;;
+    yarn)
+      install_cmd="yarn install --frozen-lockfile"
+      build_cmd="yarn build"
+      ;;
+  esac
+
+  cat > "${SCRIPT_DIR}/Dockerfile" <<EOF
+# --- Dependencies ---
+FROM node:22-alpine AS deps
+${pm_setup}
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* yarn.lock* package-lock.json* ./
+RUN ${install_cmd}
+
+# --- Build ---
+FROM node:22-alpine AS build
+${pm_setup}
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN ${build_cmd}
+
+# --- Production ---
+FROM node:22-alpine AS production
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY --from=build /app/public ./public
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+EXPOSE ${APP_PORT}
+CMD ["node", "server.js"]
+EOF
+}
+
+generate_dockerfile_react_spa() {
+  local pm=$(detect_package_manager)
+  local install_cmd="npm ci"
+  local build_cmd="npm run build"
+
+  case "$pm" in
+    pnpm) install_cmd="pnpm install --frozen-lockfile"; build_cmd="pnpm build" ;;
+    yarn) install_cmd="yarn install --frozen-lockfile"; build_cmd="yarn build" ;;
+  esac
+
+  cat > "${SCRIPT_DIR}/Dockerfile" <<EOF
+# --- Build ---
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* yarn.lock* package-lock.json* ./
+RUN ${install_cmd}
+COPY . .
+RUN ${build_cmd}
+
+# --- Serve with nginx ---
+FROM nginx:alpine AS production
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY --from=build /app/build /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+EOF
+}
+
+generate_dockerfile_python() {
+  local project_type="$1"
+  local start_cmd=""
+
+  case "$project_type" in
+    django)   start_cmd="gunicorn config.wsgi:application --bind 0.0.0.0:${APP_PORT}" ;;
+    fastapi)  start_cmd="uvicorn main:app --host 0.0.0.0 --port ${APP_PORT}" ;;
+    flask)    start_cmd="gunicorn app:app --bind 0.0.0.0:${APP_PORT}" ;;
+    *)        start_cmd="python main.py" ;;
+  esac
+
+  local install_source="requirements.txt"
+  if [ -f "${SCRIPT_DIR}/pyproject.toml" ]; then
+    install_source="pyproject.toml"
+  fi
+
+  cat > "${SCRIPT_DIR}/Dockerfile" <<EOF
+FROM python:3.12-slim AS production
+WORKDIR /app
+COPY ${install_source} ./
+$(if [ "$install_source" = "pyproject.toml" ]; then
+  echo "RUN pip install --no-cache-dir ."
+else
+  echo "RUN pip install --no-cache-dir -r requirements.txt"
+fi)
+COPY . .
+EXPOSE ${APP_PORT}
+CMD ${start_cmd}
+EOF
+}
+
+generate_dockerfile_go() {
+  cat > "${SCRIPT_DIR}/Dockerfile" <<EOF
+# --- Build ---
+FROM golang:1.23-alpine AS build
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server .
+
+# --- Production ---
+FROM alpine:3.20 AS production
+RUN apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=build /app/server .
+EXPOSE ${APP_PORT}
+CMD ["./server"]
+EOF
+}
+
+generate_compose() {
+  local app_port="$1"
+  local extra_containers="$2"
+
+  mkdir -p "$DEPLOY_DIR"
+
+  # Start with the app service
+  cat > "${DEPLOY_DIR}/docker-compose.prod.yml" <<'COMPOSE_HEAD'
+services:
+  app:
+    image: ghcr.io/${GITHUB_REPOSITORY:-your-org/app}:${APP_VERSION:-latest}
+    container_name: ${APP_NAME}-app
+    restart: always
+    env_file:
+      - .env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${APP_NAME}.rule=Host(`${APP_DOMAIN:-localhost}`)"
+      - "traefik.http.routers.${APP_NAME}.entrypoints=websecure"
+      - "traefik.http.routers.${APP_NAME}.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.${APP_NAME}.service=${APP_NAME}-svc"
+COMPOSE_HEAD
+
+  # Add port label
+  cat >> "${DEPLOY_DIR}/docker-compose.prod.yml" <<EOF
+      - "traefik.http.services.\${APP_NAME}-svc.loadbalancer.server.port=${app_port}"
+      # IP-based fallback routing
+      - "traefik.http.routers.\${APP_NAME}-ip.rule=PathPrefix(\`/\${APP_NAME}\`)"
+      - "traefik.http.routers.\${APP_NAME}-ip.entrypoints=web"
+      - "traefik.http.routers.\${APP_NAME}-ip.service=\${APP_NAME}-svc"
+      - "traefik.http.routers.\${APP_NAME}-ip.middlewares=\${APP_NAME}-strip"
+      - "traefik.http.middlewares.\${APP_NAME}-strip.stripprefix.prefixes=/\${APP_NAME}"
+      # Rate limiting
+      - "traefik.http.routers.\${APP_NAME}.middlewares=\${APP_NAME}-ratelimit"
+      - "traefik.http.middlewares.\${APP_NAME}-ratelimit.ratelimit.average=30"
+      - "traefik.http.middlewares.\${APP_NAME}-ratelimit.ratelimit.burst=50"
+    networks:
+      - proxy
+      - shared-db
+      - internal
+
+networks:
+  proxy:
+    external: true
+  shared-db:
+    external: true
+  internal:
+    driver: bridge
+EOF
+
+  info "Generated .deploy/infra/docker-compose.prod.yml"
+  warn "Review and customize the compose file for your project's needs"
+}
+
+generate_env_example() {
+  local app_port="$1"
+  mkdir -p "$DEPLOY_DIR"
+
+  cat > "${DEPLOY_DIR}/.env.example" <<EOF
+# =============================================================================
+# Production Environment Variables
+# Auto-generated by ./deploy setup-project
+# =============================================================================
+
+# --- App Identity ---
+APP_NAME=my-app
+GITHUB_REPOSITORY=your-org/your-repo
+APP_VERSION=latest
+NODE_ENV=production
+
+# --- Domain ---
+APP_DOMAIN=
+
+# --- Database (shared Postgres) ---
+DB_USERNAME=myapp
+DB_PASSWORD=CHANGE_ME
+DB_DATABASE=myapp
+DB_HOST=shared-postgres
+DB_PORT=5432
+
+# --- Redis (shared) ---
+REDIS_HOST=shared-redis
+REDIS_PORT=6379
+REDIS_PASSWORD=CHANGE_ME
+
+# --- App Port ---
+PORT=${app_port}
+EOF
+
+  info "Generated .deploy/infra/.env.example"
+  warn "Add your app-specific env vars to this file"
+}
+
+# ---------------------------------------------------------------------------
+# Input cache — remembers values between runs
+# ---------------------------------------------------------------------------
+
+cache_get() {
+  local key="$1"
+  local cache_file="${CACHE_DIR}/${ENV_NAME:-_global}"
+  if [ -f "$cache_file" ]; then
+    grep "^${key}=" "$cache_file" 2>/dev/null | head -1 | cut -d'=' -f2-
+  fi
+}
+
+cache_set() {
+  local key="$1"
+  local value="$2"
+  local cache_file="${CACHE_DIR}/${ENV_NAME:-_global}"
+  mkdir -p "$CACHE_DIR"
+  # Remove old entry, append new
+  if [ -f "$cache_file" ]; then
+    grep -v "^${key}=" "$cache_file" > "${cache_file}.tmp" 2>/dev/null || true
+    mv "${cache_file}.tmp" "$cache_file"
+  fi
+  echo "${key}=${value}" >> "$cache_file"
+}
+
+# ---------------------------------------------------------------------------
+# Interactive prompt helpers
+# ---------------------------------------------------------------------------
+
+prompt_default() {
+  local prompt="$1"
+  local default="${2:-}"
+  local result
+
+  if [ -n "$default" ]; then
+    read -rp "$(echo -e "${CYAN}[?]${NC} ${prompt} [${default}]: ")" result
+    echo "${result:-$default}"
+  else
+    read -rp "$(echo -e "${CYAN}[?]${NC} ${prompt}: ")" result
+    echo "$result"
+  fi
+}
+
+# Prompt with cache — checks cache for previous value, saves result
+prompt_cached() {
+  local key="$1"
+  local prompt="$2"
+  local fallback="${3:-}"
+  local cached
+  cached=$(cache_get "$key")
+  local default="${cached:-$fallback}"
+  local result
+  result=$(prompt_default "$prompt" "$default")
+  if [ -n "$result" ]; then
+    cache_set "$key" "$result"
+  fi
+  echo "$result"
+}
+
+prompt_required() {
+  local prompt="$1"
+  local result=""
+  while [ -z "$result" ]; do
+    result=$(prompt_default "$prompt" "${2:-}")
+    if [ -z "$result" ]; then
+      echo -e "${RED}  This field is required${NC}" >&2
+    fi
+  done
+  echo "$result"
+}
+
+# Prompt required with cache
+prompt_required_cached() {
+  local key="$1"
+  local prompt="$2"
+  local fallback="${3:-}"
+  local cached
+  cached=$(cache_get "$key")
+  local default="${cached:-$fallback}"
+  local result=""
+  while [ -z "$result" ]; do
+    result=$(prompt_default "$prompt" "$default")
+    if [ -z "$result" ]; then
+      echo -e "${RED}  This field is required${NC}" >&2
+    fi
+  done
+  cache_set "$key" "$result"
+  echo "$result"
+}
+
+confirm() {
+  local result
+  read -rp "$(echo -e "${CYAN}[?]${NC} ${1} (y/n): ")" result
+  [ "$result" = "y" ] || [ "$result" = "Y" ]
+}
+
+# Show numbered menu, sets MENU_RESULT to selected number (1-based)
+# Usage: pick_option "Header" "option1" "option2" ...
+MENU_RESULT=0
+pick_option() {
+  local header="$1"
+  shift
+  local options=("$@")
+
+  echo ""
+  echo -e "${BOLD}${header}${NC}"
+  echo ""
+  for i in "${!options[@]}"; do
+    echo -e "  ${CYAN}$((i + 1))${NC}  ${options[$i]}"
+  done
+  echo ""
+
+  local choice
+  while true; do
+    read -rp "$(echo -e "${CYAN}[?]${NC} Select (1-${#options[@]}): ")" choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
+      MENU_RESULT="$choice"
+      return 0
+    fi
+    echo -e "${RED}  Invalid choice${NC}"
+  done
+}
+
+# List remotes and let user pick one, or create new
+# Sets ENV_NAME and calls parse_remote
+pick_environment() {
+  local remotes=()
+  local remote_names=()
+
+  if [ -d "$REMOTES_DIR" ] && [ "$(ls -A "$REMOTES_DIR" 2>/dev/null)" ]; then
+    for f in "$REMOTES_DIR"/*; do
+      [ -f "$f" ] || continue
+      local name=$(basename "$f")
+      local content=$(cat "$f" | tr -d '[:space:]')
+      remote_names+=("$name")
+      remotes+=("${name}  →  ${content}")
+    done
+  fi
+
+  if [ ${#remotes[@]} -eq 0 ]; then
+    warn "No environments configured yet."
+    echo ""
+    info "Let's set one up."
+    COMMAND="init"
+    cmd_init
+    exit 0
+  fi
+
+  # Add "create new" option
+  remotes+=("Create new environment")
+
+  pick_option "Select environment" "${remotes[@]}"
+  local selected=$?
+
+  if [ "$selected" -gt "${#remote_names[@]}" ]; then
+    # Selected "Create new"
+    COMMAND="init"
+    cmd_init
+    exit 0
+  fi
+
+  ENV_NAME="${remote_names[$((selected - 1))]}"
+  parse_remote
+}
+
+# =============================================================================
+# Parse remote file into variables
+# =============================================================================
+
+parse_remote() {
+  REMOTE_FILE="${REMOTES_DIR}/${ENV_NAME}"
+
+  if [ ! -f "$REMOTE_FILE" ]; then
+    error "Remote '${ENV_NAME}' not found. Run: ./deploy init"
+  fi
+
+  REMOTE_RAW=$(cat "$REMOTE_FILE" | tr -d '[:space:]')
+
+  SSH_PART="${REMOTE_RAW%%:*}"
+  APP_PART="${REMOTE_RAW#*:}"
+
+  SSH_USER="${SSH_PART%%@*}"
+  SSH_HOST="${SSH_PART#*@}"
+
+  APP_NAME="${APP_PART%%.*}"
+  APP_DOMAIN="${APP_PART#*.}"
+
+  if [ "$APP_NAME" = "$APP_PART" ]; then
+    APP_DOMAIN=""
+  fi
+
+  APP_DIR="/opt/apps/${APP_NAME}"
+  DATA_DIR="/mnt/data/apps/${APP_NAME}"
+}
+
+# ---------------------------------------------------------------------------
+# SSH helpers
+# ---------------------------------------------------------------------------
+
+remote() {
+  ssh -q -o ConnectTimeout=10 "${SSH_USER}@${SSH_HOST}" "$@"
+}
+
+remote_check() {
+  ssh -q -o ConnectTimeout=5 "${SSH_USER}@${SSH_HOST}" "echo ok" > /dev/null 2>&1 \
+    || error "Cannot SSH to ${SSH_USER}@${SSH_HOST}. Check your SSH key and server."
+}
+
+# ---------------------------------------------------------------------------
+# Parse arguments — interactive menu or direct commands
+# ---------------------------------------------------------------------------
+
+COMMAND="${1:-}"
+ENV_NAME="${2:-}"
+
+# Commands that need an environment
+ENV_COMMANDS="deploy setup-server setup-app logs status ssh"
+
+# No arguments — full interactive USSD-style menu
+if [ -z "$COMMAND" ]; then
+  echo ""
+  echo -e "${BOLD}Deploy CLI${NC}"
+  echo -e "$(basename "$SCRIPT_DIR")"
+
+  # --- Menu 1: Action ---
+  # Auto-trigger project setup if no config exists
+  if [ ! -f "$CONFIG_FILE" ]; then
+    warn "No project configuration found."
+    info "Let's configure this project first."
+    cmd_setup_project
+  fi
+
+  pick_option "What would you like to do?" \
+    "Deploy                  Build, push, and deploy to server" \
+    "Check                   Verify app is running and healthy" \
+    "Env vars                View, set, or edit environment variables" \
+    "Restart                 Restart the app" \
+    "View logs               Tail container logs" \
+    "Check status            Show running containers" \
+    "SSH to server           Open terminal on server" \
+    "Setup new environment   Configure server + app from scratch" \
+    "Setup GitHub / GHCR     Login to GitHub Container Registry" \
+    "Setup project config    Configure app settings (port, health, etc.)" \
+    "Setup server only       Install shared infrastructure" \
+    "Setup app only          Configure app on existing server"
+
+  case $MENU_RESULT in
+    1) COMMAND="deploy" ;;
+    2) COMMAND="check" ;;
+    3) COMMAND="env" ;;
+    4) COMMAND="restart" ;;
+    5) COMMAND="logs" ;;
+    6) COMMAND="status" ;;
+    7) COMMAND="ssh" ;;
+    8) COMMAND="init" ;;
+    9) COMMAND="setup-github" ;;
+    10) COMMAND="setup-project" ;;
+    11) COMMAND="setup-server" ;;
+    12) COMMAND="setup-app" ;;
+  esac
+
+  # --- Menu 2: Environment (for commands that need one) ---
+  if [ "$COMMAND" != "init" ] && [ "$COMMAND" != "setup-github" ] && [ "$COMMAND" != "setup-project" ]; then
+    # Collect available remotes
+    remote_names=()
+    remote_labels=()
+
+    if [ -d "$REMOTES_DIR" ] && [ "$(ls -A "$REMOTES_DIR" 2>/dev/null)" ]; then
+      for f in "$REMOTES_DIR"/*; do
+        [ -f "$f" ] || continue
+        local_name=$(basename "$f")
+        local_content=$(cat "$f" | tr -d '[:space:]')
+        remote_names+=("$local_name")
+        remote_labels+=("${local_name}  →  ${local_content}")
+      done
+    fi
+
+    if [ ${#remote_names[@]} -eq 0 ]; then
+      warn "No environments configured yet."
+      info "Switching to full setup wizard..."
+      echo ""
+      COMMAND="init"
+    else
+      # Add "new environment" option
+      remote_labels+=("+ New environment")
+
+      pick_option "Select environment" "${remote_labels[@]}"
+
+      if [ "$MENU_RESULT" -gt "${#remote_names[@]}" ]; then
+        # Selected "New environment"
+        COMMAND="init"
+      else
+        ENV_NAME="${remote_names[$((MENU_RESULT - 1))]}"
+        parse_remote
+
+        echo ""
+        info "Environment: ${ENV_NAME}"
+        info "Server:      ${SSH_USER}@${SSH_HOST}"
+        info "App name:    ${APP_NAME}"
+        [ -n "$APP_DOMAIN" ] && info "Domain:      ${APP_DOMAIN}"
+      fi
+    fi
+  fi
+
+# With arguments — route directly
+else
+  case "$COMMAND" in
+    init|setup-github|setup-project) ;;
+    setup-server|setup-app|check|logs|status|ssh|env|restart)
+      if [ -z "$ENV_NAME" ]; then
+        error "Missing environment. Usage: ./deploy ${COMMAND} <environment>"
+      fi
+      parse_remote
+      ;;
+    *)
+      ENV_NAME="$COMMAND"
+      COMMAND="deploy"
+      parse_remote
+      ;;
+  esac
+fi
+
+# =============================================================================
+# COMMAND: init — Full interactive setup
+# =============================================================================
+
+cmd_init() {
+  # Ensure project is configured first
+  if [ ! -f "$CONFIG_FILE" ]; then
+    cmd_setup_project
+  fi
+
+  echo ""
+  echo -e "${BOLD}=== Deploy Setup Wizard ===${NC}"
+  echo ""
+  echo "This will walk you through setting up a deployment environment."
+  echo "It will configure the remote, set up the server, and prepare your app."
+  echo ""
+
+  # -------------------------------------------------------------------------
+  # Step 1: Environment name
+  # -------------------------------------------------------------------------
+
+  echo -e "${BOLD}1. Environment${NC}"
+  echo ""
+  local cached_env=$(cache_get "ENV_NAME")
+  ENV_NAME=$(prompt_required "Environment name (e.g., production, staging)" "$cached_env")
+  cache_set "ENV_NAME" "$ENV_NAME"
+
+  # Validate
+  if ! echo "$ENV_NAME" | grep -qE '^[a-z][a-z0-9-]*$'; then
+    error "Environment name must be lowercase alphanumeric with hyphens"
+  fi
+
+  REMOTE_FILE="${REMOTES_DIR}/${ENV_NAME}"
+
+  # Check if remote already exists
+  if [ -f "$REMOTE_FILE" ]; then
+    echo ""
+    info "Remote '${ENV_NAME}' already exists: $(cat "$REMOTE_FILE" | tr -d '[:space:]')"
+    if ! confirm "Reconfigure it?"; then
+      # Use existing remote, skip to server/app setup
+      parse_remote
+      echo ""
+      if confirm "Set up the server (shared infrastructure)?"; then
+        cmd_setup_server
+      fi
+      echo ""
+      if confirm "Set up the app on the server?"; then
+        cmd_setup_app
+      fi
+      return
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 2: Server details
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}2. Server${NC}"
+  echo ""
+  SSH_USER=$(prompt_cached "SSH_USER" "SSH user" "root")
+  SSH_HOST=$(prompt_required_cached "SSH_HOST" "Server IP or hostname")
+
+  # Test SSH
+  echo ""
+  info "Testing SSH connection to ${SSH_USER}@${SSH_HOST}..."
+  if ssh -q -o ConnectTimeout=5 -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" "echo ok" > /dev/null 2>&1; then
+    info "SSH connection successful"
+  else
+    warn "SSH connection failed. Make sure your key is set up."
+    if ! confirm "Continue anyway?"; then
+      exit 1
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 3: App details
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}3. App${NC}"
+  echo ""
+
+  # Suggest app name from folder
+  local folder_name=$(basename "$SCRIPT_DIR" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+  # Add environment suffix for non-production
+  local suggested_name="$folder_name"
+  if [ "$ENV_NAME" != "production" ]; then
+    suggested_name="${folder_name}-${ENV_NAME}"
+  fi
+
+  APP_NAME=$(prompt_cached "APP_NAME" "App name" "$suggested_name")
+  APP_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+  cache_set "APP_NAME" "$APP_NAME"
+
+  # -------------------------------------------------------------------------
+  # Step 4: Domain
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}4. Domain${NC}"
+  echo ""
+  echo "  If you have a domain, enter it. Otherwise leave empty for IP-based routing."
+  echo "  Make sure the DNS A record points to ${SSH_HOST} before deploying."
+  echo ""
+  APP_DOMAIN=$(prompt_cached "APP_DOMAIN" "Domain (e.g., api.yourdomain.com)")
+
+  if [ -n "$APP_DOMAIN" ]; then
+    # Check DNS
+    local resolved_ip=$(dig +short "$APP_DOMAIN" 2>/dev/null | head -1)
+    if [ "$resolved_ip" = "$SSH_HOST" ]; then
+      info "DNS verified: ${APP_DOMAIN} → ${SSH_HOST}"
+    elif [ -n "$resolved_ip" ]; then
+      warn "DNS mismatch: ${APP_DOMAIN} → ${resolved_ip} (expected ${SSH_HOST})"
+      warn "SSL certificates won't work until DNS is correct"
+    else
+      warn "${APP_DOMAIN} does not resolve yet. SSL will work once DNS propagates."
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 5: ACME email (for SSL)
+  # -------------------------------------------------------------------------
+
+  ACME_EMAIL=""
+  if [ -n "$APP_DOMAIN" ]; then
+    echo ""
+    echo -e "${BOLD}5. SSL Certificate${NC}"
+    echo ""
+    ACME_EMAIL=$(prompt_required_cached "ACME_EMAIL" "Email for Let's Encrypt SSL certificates")
+  fi
+
+  # -------------------------------------------------------------------------
+  # Save remote
+  # -------------------------------------------------------------------------
+
+  echo ""
+  info "Saving remote configuration..."
+  mkdir -p "$REMOTES_DIR"
+
+  if [ -n "$APP_DOMAIN" ]; then
+    echo "${SSH_USER}@${SSH_HOST}:${APP_NAME}.${APP_DOMAIN}" > "$REMOTE_FILE"
+  else
+    echo "${SSH_USER}@${SSH_HOST}:${APP_NAME}" > "$REMOTE_FILE"
+  fi
+
+  info "Saved to .deploy/remotes/${ENV_NAME}"
+
+  # Set derived vars
+  APP_DIR="/opt/apps/${APP_NAME}"
+  DATA_DIR="/mnt/data/apps/${APP_NAME}"
+
+  # -------------------------------------------------------------------------
+  # Summary
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}=== Summary ===${NC}"
+  echo ""
+  echo "  Environment:  ${ENV_NAME}"
+  echo "  Server:       ${SSH_USER}@${SSH_HOST}"
+  echo "  App name:     ${APP_NAME}"
+  if [ -n "$APP_DOMAIN" ]; then
+    echo "  Domain:       ${APP_DOMAIN}"
+  else
+    echo "  Routing:      IP-based (http://${SSH_HOST}/${APP_NAME}/api/...)"
+  fi
+  echo "  Remote file:  .deploy/remotes/${ENV_NAME}"
+  echo ""
+
+  if ! confirm "Proceed with setup?"; then
+    info "Remote saved. You can run individual steps later:"
+    echo "  ./deploy setup-server ${ENV_NAME}"
+    echo "  ./deploy setup-app ${ENV_NAME}"
+    echo "  ./deploy ${ENV_NAME}"
+    exit 0
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 6: Server setup
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}=== Setting Up Server ===${NC}"
+  echo ""
+
+  # Check if server is already set up
+  SHARED_EXISTS=$(ssh -q -o ConnectTimeout=5 "${SSH_USER}@${SSH_HOST}" "[ -f /opt/shared/.env ] && echo 'exists' || echo 'missing'" 2>/dev/null || echo "unreachable")
+
+  if [ "$SHARED_EXISTS" = "exists" ]; then
+    info "Shared infrastructure already exists on server"
+    if confirm "Re-run server setup anyway?"; then
+      cmd_setup_server_with_acme "$ACME_EMAIL"
+    else
+      info "Skipping server setup"
+    fi
+  else
+    cmd_setup_server_with_acme "$ACME_EMAIL"
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 7: App setup
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}=== Setting Up App ===${NC}"
+  echo ""
+  cmd_setup_app
+
+  # -------------------------------------------------------------------------
+  # Done
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${GREEN}${BOLD}=== All Done! ===${NC}"
+  echo ""
+  echo "  Deploy with:     ./deploy ${ENV_NAME}"
+  echo "  View logs:       ./deploy logs ${ENV_NAME}"
+  echo "  Check status:    ./deploy status ${ENV_NAME}"
+  echo "  SSH to server:   ./deploy ssh ${ENV_NAME}"
+  echo ""
+  if [ -n "$APP_DOMAIN" ]; then
+    echo "  Your app will be at: https://${APP_DOMAIN}"
+  else
+    echo "  Your app will be at: http://${SSH_HOST}/${APP_NAME}/api/v1"
+  fi
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: setup-server (with optional ACME email)
+# =============================================================================
+
+cmd_setup_server_with_acme() {
+  local acme_email="${1:-}"
+
+  info "Setting up server at ${SSH_HOST}..."
+  remote_check
+
+  info "Copying shared infrastructure files..."
+  scp -q -r "${DEPLOY_DIR}/shared" "${SSH_USER}@${SSH_HOST}:/tmp/shared-setup"
+
+  remote ACME_EMAIL="$acme_email" bash <<'REMOTE_SCRIPT'
+set -euo pipefail
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+
+if ! command -v docker &> /dev/null; then
+  info "Installing Docker..."
+  apt-get update -qq
+  curl -fsSL https://get.docker.com | sh
+  systemctl enable docker
+  systemctl start docker
+  apt-get install -y -qq docker-compose-plugin
+else
+  info "Docker already installed"
+fi
+
+info "Creating directory structure..."
+mkdir -p /opt/shared/traefik
+mkdir -p /opt/apps
+mkdir -p /mnt/data/shared/postgres
+mkdir -p /mnt/data/shared/redis
+mkdir -p /mnt/data/backups
+
+info "Creating Docker networks..."
+docker network create proxy 2>/dev/null && info "Created 'proxy' network" || info "'proxy' network already exists"
+docker network create shared-db 2>/dev/null && info "Created 'shared-db' network" || info "'shared-db' network already exists"
+
+cp /tmp/shared-setup/docker-compose.yml /opt/shared/
+cp /tmp/shared-setup/init-databases.sh /opt/shared/
+chmod +x /opt/shared/init-databases.sh
+mkdir -p /opt/shared/traefik
+cp /tmp/shared-setup/traefik/traefik.yml /opt/shared/traefik/
+rm -rf /tmp/shared-setup
+
+touch /opt/shared/traefik/acme.json
+chmod 600 /opt/shared/traefik/acme.json
+
+if [ -f /opt/shared/.env ]; then
+  warn "/opt/shared/.env already exists — keeping existing"
+  # Update ACME email if provided
+  if [ -n "${ACME_EMAIL:-}" ]; then
+    sed -i "s|^ACME_EMAIL=.*|ACME_EMAIL=${ACME_EMAIL}|" /opt/shared/.env
+    info "Updated ACME_EMAIL"
+  fi
+else
+  info "Generating shared .env with random passwords..."
+  PG_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+  RD_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+
+  cat > /opt/shared/.env <<EOF
+# Auto-generated by deploy.sh
+ACME_EMAIL=${ACME_EMAIL:-admin@example.com}
+POSTGRES_ADMIN_USER=pgadmin
+POSTGRES_ADMIN_PASSWORD=${PG_PASS}
+REDIS_PASSWORD=${RD_PASS}
+EOF
+  chmod 600 /opt/shared/.env
+
+  echo ""
+  warn "IMPORTANT — save these credentials:"
+  echo "  Postgres admin: ${PG_PASS}"
+  echo "  Redis:          ${RD_PASS}"
+  echo ""
+fi
+
+if ! swapon --show | grep -q '/swapfile'; then
+  info "Setting up 4GB swap..."
+  fallocate -l 4G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+else
+  info "Swap already configured"
+fi
+
+if command -v ufw &> /dev/null; then
+  info "Configuring firewall..."
+  ufw allow 22/tcp
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+  ufw --force enable
+fi
+
+if ! dpkg -l 2>/dev/null | grep -q unattended-upgrades; then
+  info "Enabling automatic security updates..."
+  apt-get install -y -qq unattended-upgrades
+  dpkg-reconfigure -plow unattended-upgrades
+fi
+
+info "Starting shared infrastructure..."
+cd /opt/shared
+set -a; source .env; set +a
+docker compose up -d
+
+info "Waiting for Postgres..."
+timeout 30 bash -c 'until docker exec shared-postgres pg_isready -U "$POSTGRES_ADMIN_USER" 2>/dev/null; do sleep 2; done' \
+  && info "Postgres ready" || warn "Postgres timeout — check: docker logs shared-postgres"
+
+info "Waiting for Redis..."
+timeout 30 bash -c 'until docker exec shared-redis redis-cli -a "$REDIS_PASSWORD" ping 2>/dev/null | grep -q PONG; do sleep 2; done' \
+  && info "Redis ready" || warn "Redis timeout — check: docker logs shared-redis"
+
+echo ""
+info "Server setup complete!"
+REMOTE_SCRIPT
+}
+
+cmd_setup_server() {
+  # When called standalone, ask for ACME email
+  echo ""
+  local acme_email=$(prompt_default "ACME email for SSL certificates" "admin@example.com")
+  cmd_setup_server_with_acme "$acme_email"
+}
+
+# =============================================================================
+# COMMAND: setup-app
+# =============================================================================
+
+cmd_setup_app() {
+  info "Setting up app '${APP_NAME}' on ${SSH_HOST}..."
+  remote_check
+
+  # Check shared infra
+  local shared_check=$(remote "[ -f /opt/shared/.env ] && echo 'exists' || echo 'missing'")
+  if [ "$shared_check" = "missing" ]; then
+    error "Shared infra not found. Run: ./deploy setup-server ${ENV_NAME}"
+  fi
+
+  # Check if already set up
+  local app_check=$(remote "[ -f ${APP_DIR}/.env ] && echo 'exists' || echo 'missing'")
+  if [ "$app_check" = "exists" ]; then
+    warn "${APP_DIR}/.env already exists on server"
+    if ! confirm "Overwrite?"; then
+      info "Keeping existing config. Deploy with: ./deploy ${ENV_NAME}"
+      return
+    fi
+  fi
+
+  # Get Redis password
+  local shared_redis_pw=$(remote "grep '^REDIS_PASSWORD=' /opt/shared/.env | cut -d'=' -f2-")
+
+  # Find template
+  local env_example=""
+  if [ -f "${DEPLOY_DIR}/.env.example" ]; then
+    env_example="${DEPLOY_DIR}/.env.example"
+  elif [ -f "${SCRIPT_DIR}/.env.example" ]; then
+    env_example="${SCRIPT_DIR}/.env.example"
+  else
+    error "No .env.example found in deploy/ or project root"
+  fi
+
+  info "Using template: ${env_example}"
+
+  local db_pass=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+  local db_user="${APP_NAME//-/_}"
+  local db_name="${APP_NAME//-/_}"
+
+  # Build .env
+  ENV_CONTENT=$(cat "$env_example")
+
+  apply_var() { ENV_CONTENT=$(echo "$ENV_CONTENT" | sed "s|^${1}=.*|${1}=${2}|"); }
+
+  # --- Auto-fill known values ---
+  apply_var "APP_NAME" "$APP_NAME"
+  apply_var "NODE_ENV" "$ENV_NAME"
+  apply_var "APP_DOMAIN" "$APP_DOMAIN"
+  apply_var "DB_USERNAME" "$db_user"
+  apply_var "DB_PASSWORD" "$db_pass"
+  apply_var "DB_DATABASE" "$db_name"
+  apply_var "REDIS_PASSWORD" "$shared_redis_pw"
+  apply_var "MINIO_BUCKET" "$APP_NAME"
+
+  if [ "$ENV_NAME" = "staging" ]; then
+    apply_var "DB_LOGGING" "true"
+  else
+    apply_var "DB_LOGGING" "false"
+  fi
+
+  # --- Auto-generate secrets from config ---
+  info "Auto-generating secrets..."
+  for secret_key in $AUTO_SECRETS; do
+    # Check if key exists in template
+    if echo "$ENV_CONTENT" | grep -q "^${secret_key}="; then
+      local secret_val=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+      apply_var "$secret_key" "$secret_val"
+    fi
+  done
+
+  # --- Apply domain-dependent templates ---
+  if [ -n "$APP_DOMAIN" ]; then
+    for tmpl in $DOMAIN_TEMPLATES; do
+      local tmpl_key="${tmpl%%=*}"
+      local tmpl_val="${tmpl#*=}"
+      # Replace ${DOMAIN} with actual domain
+      tmpl_val=$(echo "$tmpl_val" | sed "s|\\\${DOMAIN}|${APP_DOMAIN}|g")
+      if echo "$ENV_CONTENT" | grep -q "^${tmpl_key}="; then
+        apply_var "$tmpl_key" "$tmpl_val"
+      fi
+    done
+  fi
+
+  # --- Auto-detect GitHub repo ---
+  local git_repo=""
+  git_repo=$(git remote get-url origin 2>/dev/null \
+    | sed -E 's|^https://github\.com/||; s|^git@github\.com:||; s|\.git$||' \
+  ) || true
+  if [ -n "$git_repo" ]; then
+    apply_var "GITHUB_REPOSITORY" "$git_repo"
+    info "Detected GitHub repo: ${git_repo}"
+  fi
+
+  # --- Prompt for remaining unfilled values ---
+  echo ""
+  echo -e "${BOLD}App Configuration${NC}"
+  echo -e "Press Enter to skip optional values"
+  echo ""
+
+  prompt_and_apply() {
+    local key="$1"
+    local desc="$2"
+    local current
+    current=$(echo "$ENV_CONTENT" | grep "^${key}=" | head -1 | cut -d'=' -f2-)
+
+    # Already has a real value (not a placeholder) — skip
+    if [ -n "$current" ] && ! echo "$current" | grep -qiE 'CHANGE_ME|your-org|your-email|yourdomain|xxxxx|sk-ant|sk-'; then
+      return
+    fi
+
+    # Check cache for previously entered value
+    local cached
+    cached=$(cache_get "$key")
+
+    local value
+    value=$(prompt_default "$desc" "$cached")
+    if [ -n "$value" ]; then
+      # Quote values with special shell characters
+      if echo "$value" | grep -qE '[<>|&;()$ ]'; then
+        value="\"${value}\""
+      fi
+      apply_var "$key" "$value"
+      cache_set "$key" "$value"
+    fi
+  }
+
+  # Dynamically prompt for every unfilled value in the template
+  local current_section=""
+  while IFS= read -r line; do
+    # Track section headers from comments
+    if [[ "$line" =~ ^#\ ---\ (.+)\ --- ]]; then
+      current_section="${BASH_REMATCH[1]}"
+      continue
+    fi
+
+    # Skip comments and blank lines
+    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+
+    # Parse KEY=VALUE
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*) ]]; then
+      local key="${BASH_REMATCH[1]}"
+      local value="${BASH_REMATCH[2]}"
+
+      # Skip keys we already auto-filled
+      local current_val
+      current_val=$(echo "$ENV_CONTENT" | grep "^${key}=" | head -1 | cut -d'=' -f2-)
+      if [ -n "$current_val" ] && ! echo "$current_val" | grep -qiE 'CHANGE_ME|your-org|your-email|yourdomain|xxxxx|sk-ant|sk-'; then
+        continue
+      fi
+
+      # Show section header if entering a new section
+      if [ -n "$current_section" ]; then
+        echo ""
+        echo -e "${YELLOW}--- ${current_section} ---${NC}"
+        current_section=""
+      fi
+
+      prompt_and_apply "$key" "$key"
+    fi
+  done < "$env_example"
+
+  echo ""
+  info "Deploying to server..."
+
+  # Write .env to a temp file and scp it (avoids nested heredoc issues)
+  local tmp_env=$(mktemp)
+  echo "$ENV_CONTENT" > "$tmp_env"
+
+  # Uppercase app name for env var prefix
+  local app_name_upper
+  app_name_upper=$(echo "$APP_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+
+  # Create directories and upload .env
+  remote "mkdir -p ${APP_DIR} ${DATA_DIR}"
+  scp -q "$tmp_env" "${SSH_USER}@${SSH_HOST}:${APP_DIR}/.env"
+  remote "chmod 600 ${APP_DIR}/.env"
+  rm -f "$tmp_env"
+
+  # Create database
+  info "Creating database..."
+  remote "set -a && source /opt/shared/.env && set +a && docker exec -i shared-postgres psql -U \"\$POSTGRES_ADMIN_USER\" -d postgres" <<EOSQL
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${db_user}') THEN
+        CREATE ROLE ${db_user} WITH LOGIN PASSWORD '${db_pass}';
+    END IF;
+END
+\$\$;
+SELECT 'CREATE DATABASE ${db_name} OWNER ${db_user}'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${db_name}')\\gexec
+GRANT ALL PRIVILEGES ON DATABASE ${db_name} TO ${db_user};
+EOSQL
+
+  # Save DB creds to shared env
+  remote "grep -q '^${app_name_upper}_DB_USER' /opt/shared/.env 2>/dev/null || cat >> /opt/shared/.env <<< '
+# --- ${APP_NAME} ---
+${app_name_upper}_DB_USER=${db_user}
+${app_name_upper}_DB_PASSWORD=${db_pass}
+${app_name_upper}_DB_NAME=${db_name}'"
+
+  if [ -f "${DEPLOY_DIR}/docker-compose.prod.yml" ]; then
+    info "Copying docker-compose.prod.yml..."
+    scp -q "${DEPLOY_DIR}/docker-compose.prod.yml" "${SSH_USER}@${SSH_HOST}:${APP_DIR}/docker-compose.prod.yml"
+  fi
+
+  echo ""
+  info "App '${APP_NAME}' setup complete!"
+  echo "  Database: ${db_name} (user: ${db_user})"
+  if [ -n "$APP_DOMAIN" ]; then
+    echo "  Domain:   ${APP_DOMAIN}"
+  fi
+}
+
+# =============================================================================
+# COMMAND: deploy
+# =============================================================================
+
+cmd_deploy() {
+  info "Deploying '${APP_NAME}' to ${ENV_NAME}..."
+  remote_check
+
+  local app_check=$(remote "[ -f ${APP_DIR}/.env ] && echo 'exists' || echo 'missing'")
+  if [ "$app_check" = "missing" ]; then
+    warn "App not set up yet on the server."
+    if confirm "Run setup now?"; then
+      cmd_setup_app
+    else
+      error "Run: ./deploy setup-app ${ENV_NAME}"
+    fi
+  fi
+
+  # --- Detect GitHub repo for image name ---
+  local git_repo=""
+  git_repo=$(git remote get-url origin 2>/dev/null \
+    | sed -E 's|^https://github\.com/||; s|^git@github\.com:||; s|\.git$||' \
+  ) || true
+
+  if [ -z "$git_repo" ]; then
+    error "Cannot detect GitHub repo from git remote. Make sure origin is set."
+  fi
+
+  local image_name="ghcr.io/${git_repo}"
+  local image_tag="${ENV_NAME}"
+  local full_image="${image_name}:${image_tag}"
+
+  # --- Build and push Docker image ---
+  info "Building Docker image..."
+  docker build -t "$full_image" --platform linux/amd64 --target production "$SCRIPT_DIR"
+
+  info "Pushing to GHCR..."
+  local push_output
+  push_output=$(docker push "$full_image" 2>&1) || {
+    echo "$push_output"
+    echo ""
+    if echo "$push_output" | grep -qi "denied\|unauthorized\|authentication"; then
+      warn "GHCR authentication failed."
+      echo ""
+      echo "  Run: ./deploy setup-github"
+      echo "  Or:  echo YOUR_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin"
+      echo ""
+      if confirm "Try pushing again?"; then
+        docker push "$full_image" || error "Push failed."
+      else
+        error "Cannot deploy without pushing the image."
+      fi
+    else
+      error "Push failed: $push_output"
+    fi
+  }
+
+  info "Image pushed: ${full_image}"
+
+  # --- Sync deployment files ---
+  info "Syncing deployment files..."
+  scp -q "${DEPLOY_DIR}/docker-compose.prod.yml" "${SSH_USER}@${SSH_HOST}:${APP_DIR}/docker-compose.prod.yml"
+  scp -q "${DEPLOY_DIR}/shared/docker-compose.yml" "${SSH_USER}@${SSH_HOST}:/opt/shared/docker-compose.yml"
+  scp -q "${DEPLOY_DIR}/shared/traefik/traefik.yml" "${SSH_USER}@${SSH_HOST}:/opt/shared/traefik/traefik.yml"
+
+  # --- Validate .env files before deploying ---
+  info "Validating .env files..."
+
+  validate_and_fix_env() {
+    local env_path="$1"
+    local env_label="$2"
+
+    while true; do
+      # Try sourcing the .env on the server — capture errors
+      local env_error
+      env_error=$(remote "bash -c 'set -a; source ${env_path} 2>&1' 2>&1") || true
+
+      if echo "$env_error" | grep -q "syntax error\|unexpected token\|bad substitution"; then
+        # Find the problematic line
+        local error_line
+        error_line=$(echo "$env_error" | grep -oE 'line [0-9]+' | head -1 | grep -oE '[0-9]+')
+
+        echo ""
+        error_no_exit "${env_label} has a syntax error"
+
+        if [ -n "$error_line" ]; then
+          # Show context around the error
+          echo ""
+          echo -e "${YELLOW}  Error near line ${error_line}:${NC}"
+          remote "sed -n '$((error_line > 2 ? error_line - 2 : 1)),${error_line}p' ${env_path}" | while IFS= read -r line; do
+            echo "    $line"
+          done
+          echo ""
+
+          # Get the problematic line content
+          local bad_line
+          bad_line=$(remote "sed -n '${error_line}p' ${env_path}")
+          local bad_key
+          bad_key=$(echo "$bad_line" | cut -d'=' -f1)
+          local bad_value
+          bad_value=$(echo "$bad_line" | cut -d'=' -f2-)
+
+          echo -e "${YELLOW}  Tip: Values with special characters (<, >, &, etc.) need quotes${NC}"
+          echo ""
+
+          pick_option "How do you want to fix this?" \
+            "Auto-fix — wrap the value in quotes" \
+            "Edit — enter a new value for ${bad_key}" \
+            "SSH — open a shell to fix it manually" \
+            "Skip — continue anyway (may fail)"
+
+          case $MENU_RESULT in
+            1)
+              # Auto-quote the value
+              remote "sed -i '${error_line}s|^${bad_key}=.*|${bad_key}=\"${bad_value}\"|' ${env_path}"
+              info "Fixed: ${bad_key} value wrapped in quotes"
+              continue  # Re-validate
+              ;;
+            2)
+              # Let user enter new value
+              local new_value
+              new_value=$(prompt_default "New value for ${bad_key}" "")
+              if [ -n "$new_value" ]; then
+                # Quote if it has special chars
+                if echo "$new_value" | grep -qE '[<>|&;()$ ]'; then
+                  new_value="\"${new_value}\""
+                fi
+                remote "sed -i '${error_line}s|^${bad_key}=.*|${bad_key}=${new_value}|' ${env_path}"
+                info "Updated ${bad_key}"
+              fi
+              continue  # Re-validate
+              ;;
+            3)
+              # Open SSH for manual fix
+              warn "Fix the file at ${env_path}, then exit the shell to continue"
+              ssh -t "${SSH_USER}@${SSH_HOST}" "nano ${env_path} || vi ${env_path}"
+              continue  # Re-validate
+              ;;
+            4)
+              warn "Skipping validation — deploy may fail"
+              break
+              ;;
+          esac
+        else
+          # Can't pinpoint the line
+          echo -e "  ${env_error}"
+          echo ""
+          if confirm "Open SSH to fix ${env_path} manually?"; then
+            ssh -t "${SSH_USER}@${SSH_HOST}" "nano ${env_path} || vi ${env_path}"
+            continue
+          else
+            break
+          fi
+        fi
+      else
+        # No errors
+        break
+      fi
+    done
+  }
+
+  # Helper that prints error without exiting
+  error_no_exit() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+  validate_and_fix_env "/opt/shared/.env" "Shared .env"
+  validate_and_fix_env "${APP_DIR}/.env" "App .env (${APP_NAME})"
+
+  # --- Ensure server can pull from GHCR ---
+  local ghcr_check
+  ghcr_check=$(remote "cat ~/.docker/config.json 2>/dev/null | grep ghcr.io" || true)
+  if [ -z "$ghcr_check" ]; then
+    warn "Server is not logged in to GHCR."
+    echo ""
+    local gh_user
+    gh_user=$(prompt_cached "GHCR_USER" "GitHub username" "$(echo "$git_repo" | cut -d'/' -f1)")
+    local gh_token
+    gh_token=$(prompt_cached "GHCR_TOKEN" "GitHub token (with read:packages scope)")
+    if [ -n "$gh_user" ] && [ -n "$gh_token" ]; then
+      remote "echo '${gh_token}' | docker login ghcr.io -u '${gh_user}' --password-stdin"
+      info "Server logged in to GHCR"
+    else
+      warn "Skipping GHCR login — pull may fail if image is private"
+    fi
+  fi
+
+  # --- Deploy ---
+  info "Deploying on server..."
+  # Build data directory creation commands from config
+  local data_dir_cmds=""
+  for dir in ${DATA_DIRS:-}; do
+    data_dir_cmds="${data_dir_cmds}mkdir -p /mnt/data/apps/${APP_NAME}/${dir}; "
+  done
+  # Empty positional args collapse during SSH transport — substitute a harmless
+  # no-op so the remote shell always sees six args under `set -u`.
+  [ -z "$data_dir_cmds" ] && data_dir_cmds=":"
+
+  remote bash -s -- "$full_image" "$APP_NAME" "$APP_DIR" "$HEALTH_PATH" "$APP_PORT" "$data_dir_cmds" <<'REMOTE_SCRIPT'
+set -euo pipefail
+
+FULL_IMAGE="$1"
+APP_NAME="$2"
+APP_DIR="$3"
+HEALTH_PATH="$4"
+APP_PORT="$5"
+DATA_DIR_CMDS="$6"
+
+docker network create proxy 2>/dev/null || true
+docker network create shared-db 2>/dev/null || true
+
+# Create data directories
+eval "$DATA_DIR_CMDS" 2>/dev/null || true
+
+cd /opt/shared
+set -a; source .env; set +a
+docker compose up -d --remove-orphans
+
+cd ${APP_DIR}
+set -a; source .env; set +a
+export APP_VERSION="${FULL_IMAGE##*:}"
+
+docker compose -f docker-compose.prod.yml pull app 2>/dev/null || true
+docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+docker image prune -f
+
+sleep 10
+if docker exec ${APP_NAME}-app wget -q -O- "http://localhost:${APP_PORT}${HEALTH_PATH}" > /dev/null 2>&1; then
+  echo "Health check passed"
+else
+  echo "WARNING: Health check failed — check: docker logs ${APP_NAME}-app"
+fi
+REMOTE_SCRIPT
+
+  echo ""
+  info "Deployed ${APP_NAME} to ${ENV_NAME}!"
+  if [ -n "$APP_DOMAIN" ]; then
+    info "URL: https://${APP_DOMAIN}"
+  else
+    info "URL: http://${SSH_HOST}/${APP_NAME}/api/v1"
+  fi
+}
+
+# =============================================================================
+# COMMAND: setup-github
+# =============================================================================
+
+cmd_setup_github() {
+  echo ""
+  echo -e "${BOLD}=== GitHub Container Registry Setup ===${NC}"
+  echo ""
+  echo "  This sets up Docker authentication so you can push images to GHCR"
+  echo "  from your machine and pull them on the server."
+  echo ""
+
+  # -------------------------------------------------------------------------
+  # Step 1: Create a GitHub token
+  # -------------------------------------------------------------------------
+
+  echo -e "${BOLD}1. Create a GitHub Personal Access Token${NC}"
+  echo ""
+  echo "  Go to: https://github.com/settings/tokens?type=beta"
+  echo ""
+  echo "  Click 'Generate new token' and configure:"
+  echo "    - Token name:   deploy-ghcr"
+  echo "    - Expiration:   90 days (or longer)"
+  echo "    - Repository:   Select your repo(s)"
+  echo "    - Permissions:"
+  echo "      - Contents:          Read"
+  echo "      - Packages:          Read and write"
+  echo "      - Metadata:          Read (auto-selected)"
+  echo ""
+  echo "  Click 'Generate token' and copy it."
+  echo ""
+
+  local gh_user
+  gh_user=$(prompt_required_cached "GHCR_USER" "Your GitHub username")
+
+  local gh_token
+  gh_token=$(prompt_required_cached "GHCR_TOKEN" "Paste your GitHub token")
+
+  # -------------------------------------------------------------------------
+  # Step 2: Login locally
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}2. Logging in to GHCR (local machine)${NC}"
+  echo ""
+
+  if echo "$gh_token" | docker login ghcr.io -u "$gh_user" --password-stdin 2>/dev/null; then
+    info "Local GHCR login successful"
+  else
+    error "Local GHCR login failed. Check your username and token."
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 3: Login on server(s)
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}3. Logging in to GHCR on server(s)${NC}"
+  echo ""
+
+  if [ -d "$REMOTES_DIR" ] && [ "$(ls -A "$REMOTES_DIR" 2>/dev/null)" ]; then
+    local servers_done=""
+    for f in "$REMOTES_DIR"/*; do
+      [ -f "$f" ] || continue
+      local remote_raw=$(cat "$f" | tr -d '[:space:]')
+      local ssh_part="${remote_raw%%:*}"
+      local server_key="${ssh_part}"
+
+      # Skip if already done this server
+      if echo "$servers_done" | grep -qF "$server_key"; then
+        continue
+      fi
+      servers_done="${servers_done}${server_key};"
+
+      info "Logging in on ${server_key}..."
+      if ssh -q -o ConnectTimeout=5 "${server_key}" \
+        "echo '${gh_token}' | docker login ghcr.io -u '${gh_user}' --password-stdin" 2>/dev/null; then
+        info "  ${server_key} — success"
+      else
+        warn "  ${server_key} — failed (check SSH access)"
+      fi
+    done
+  else
+    warn "No remotes configured yet. Server login will happen during first deploy."
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 4: Verify
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}4. Verify${NC}"
+  echo ""
+
+  local git_repo=""
+  git_repo=$(git remote get-url origin 2>/dev/null \
+    | sed -E 's|^https://github\.com/||; s|^git@github\.com:||; s|\.git$||' \
+  ) || true
+
+  if [ -n "$git_repo" ]; then
+    info "Your images will be pushed to: ghcr.io/${git_repo}"
+  fi
+
+  # -------------------------------------------------------------------------
+  # Step 5: Package visibility
+  # -------------------------------------------------------------------------
+
+  echo ""
+  echo -e "${BOLD}5. Package Visibility (first deploy only)${NC}"
+  echo ""
+  echo "  After your first push, the package will be created on GitHub."
+  echo "  If your repo is private, you may need to set package visibility:"
+  echo ""
+  echo "  Go to: https://github.com/${git_repo}/pkgs/container/$(basename "$SCRIPT_DIR")"
+  echo "    → Package settings → Manage Actions access → Add repository"
+  echo ""
+  echo "  Or make the package public if that's fine for your use case."
+
+  echo ""
+  echo -e "${GREEN}${BOLD}=== GHCR Setup Complete ===${NC}"
+  echo ""
+  echo "  You can now deploy with: ./deploy <environment>"
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: logs
+# =============================================================================
+
+cmd_logs() {
+  remote_check
+  remote "cd ${APP_DIR} && set -a && source .env && set +a && docker compose -f docker-compose.prod.yml logs -f --tail 100"
+}
+
+# =============================================================================
+# COMMAND: status
+# =============================================================================
+
+cmd_status() {
+  remote_check
+  echo ""
+  echo -e "${CYAN}--- ${APP_NAME} ---${NC}"
+  remote "cd ${APP_DIR} && set -a && source .env && set +a && docker compose -f docker-compose.prod.yml ps" 2>/dev/null || echo "  (not running)"
+  echo ""
+  echo -e "${CYAN}--- Shared Infrastructure ---${NC}"
+  remote "cd /opt/shared && set -a && source .env && set +a && docker compose ps"
+}
+
+# =============================================================================
+# COMMAND: check
+# =============================================================================
+
+cmd_check() {
+  echo ""
+  echo -e "${BOLD}=== Health Check: ${APP_NAME} (${ENV_NAME}) ===${NC}"
+  echo ""
+
+  local pass=0
+  local fail=0
+  local warn_count=0
+
+  check_pass() { echo -e "  ${GREEN}✓${NC} $1"; pass=$((pass + 1)); }
+  check_fail() { echo -e "  ${RED}✗${NC} $1"; fail=$((fail + 1)); }
+  check_warn() { echo -e "  ${YELLOW}!${NC} $1"; warn_count=$((warn_count + 1)); }
+
+  # -------------------------------------------------------------------------
+  # 1. SSH connectivity
+  # -------------------------------------------------------------------------
+  echo -e "${BOLD}Server${NC}"
+  if ssh -q -o ConnectTimeout=5 "${SSH_USER}@${SSH_HOST}" "echo ok" > /dev/null 2>&1; then
+    check_pass "SSH connection to ${SSH_USER}@${SSH_HOST}"
+  else
+    check_fail "SSH connection to ${SSH_USER}@${SSH_HOST}"
+    error "Cannot reach server — remaining checks require SSH"
+  fi
+
+  # -------------------------------------------------------------------------
+  # 2. Shared infrastructure
+  # -------------------------------------------------------------------------
+  echo ""
+  echo -e "${BOLD}Shared Infrastructure${NC}"
+
+  # Traefik
+  local traefik_status
+  traefik_status=$(remote "docker inspect -f '{{.State.Status}}' traefik 2>/dev/null" || echo "missing")
+  if [ "$traefik_status" = "running" ]; then
+    check_pass "Traefik is running"
+  else
+    check_fail "Traefik is ${traefik_status}"
+  fi
+
+  # Postgres
+  local pg_status
+  pg_status=$(remote "docker inspect -f '{{.State.Status}}' shared-postgres 2>/dev/null" || echo "missing")
+  if [ "$pg_status" = "running" ]; then
+    local pg_ready
+    pg_ready=$(remote "docker exec shared-postgres pg_isready 2>/dev/null" || echo "not ready")
+    if echo "$pg_ready" | grep -q "accepting connections"; then
+      check_pass "Postgres is running and accepting connections"
+    else
+      check_warn "Postgres container running but not accepting connections"
+    fi
+  else
+    check_fail "Postgres is ${pg_status}"
+  fi
+
+  # Redis
+  local redis_status
+  redis_status=$(remote "docker inspect -f '{{.State.Status}}' shared-redis 2>/dev/null" || echo "missing")
+  if [ "$redis_status" = "running" ]; then
+    local redis_ping
+    redis_ping=$(remote "set -a && source /opt/shared/.env && set +a && docker exec shared-redis redis-cli -a \"\$REDIS_PASSWORD\" ping 2>/dev/null" || echo "fail")
+    if echo "$redis_ping" | grep -q "PONG"; then
+      check_pass "Redis is running and responding"
+    else
+      check_warn "Redis container running but not responding to PING"
+    fi
+  else
+    check_fail "Redis is ${redis_status}"
+  fi
+
+  # -------------------------------------------------------------------------
+  # 3. App containers
+  # -------------------------------------------------------------------------
+  echo ""
+  echo -e "${BOLD}App Containers${NC}"
+
+  local app_status
+  app_status=$(remote "docker inspect -f '{{.State.Status}}' ${APP_NAME}-app 2>/dev/null" || echo "missing")
+  if [ "$app_status" = "running" ]; then
+    check_pass "App container (${APP_NAME}-app) is running"
+
+    # Check for restart loops
+    local restart_count
+    restart_count=$(remote "docker inspect -f '{{.RestartCount}}' ${APP_NAME}-app 2>/dev/null" || echo "0")
+    if [ "$restart_count" -gt 5 ] 2>/dev/null; then
+      check_warn "App has restarted ${restart_count} times (possible crash loop)"
+    fi
+
+    # Recent logs check for errors
+    local error_lines
+    error_lines=$(remote "docker logs ${APP_NAME}-app --tail 50 2>&1 | grep -ciE 'error|exception|fatal|crash'" || echo "0")
+    if [ "$error_lines" -gt 3 ] 2>/dev/null; then
+      check_warn "Found ${error_lines} error lines in recent logs"
+    fi
+  else
+    check_fail "App container (${APP_NAME}-app) is ${app_status}"
+    if [ "$app_status" != "missing" ]; then
+      echo ""
+      echo -e "  ${YELLOW}Last 10 log lines:${NC}"
+      remote "docker logs ${APP_NAME}-app --tail 10 2>&1" | while IFS= read -r line; do
+        echo "    $line"
+      done
+    fi
+  fi
+
+  # Extra containers from config
+  for container in $EXTRA_CONTAINERS; do
+    local c_status
+    c_status=$(remote "docker inspect -f '{{.State.Status}}' ${APP_NAME}-${container} 2>/dev/null" || echo "missing")
+    if [ "$c_status" = "running" ]; then
+      check_pass "${container} (${APP_NAME}-${container}) is running"
+    elif [ "$c_status" = "missing" ]; then
+      check_warn "${container} (${APP_NAME}-${container}) not found"
+    else
+      check_warn "${container} (${APP_NAME}-${container}) is ${c_status}"
+    fi
+  done
+
+  # -------------------------------------------------------------------------
+  # 4. HTTP health checks
+  # -------------------------------------------------------------------------
+  echo ""
+  echo -e "${BOLD}HTTP Health${NC}"
+
+  # Internal health check (via docker exec)
+  local internal_health
+  internal_health=$(remote "docker exec ${APP_NAME}-app wget -q -O- http://localhost:${APP_PORT}${HEALTH_PATH} 2>/dev/null" || echo "")
+  if echo "$internal_health" | grep -qE "${HEALTH_MATCH}"; then
+    check_pass "Internal health check (app:${APP_PORT}${HEALTH_PATH}) — OK"
+  elif [ -n "$internal_health" ]; then
+    check_warn "Internal health check responded but didn't match expected pattern"
+  else
+    check_fail "Internal health check — no response"
+  fi
+
+  # Traefik routing check (from server via curl to localhost)
+  local traefik_health
+  traefik_health=$(remote "curl -sf http://localhost/${APP_NAME}${HEALTH_PATH} 2>/dev/null" || echo "")
+  if echo "$traefik_health" | grep -qE "${HEALTH_MATCH}"; then
+    check_pass "Traefik path routing (/${APP_NAME}${HEALTH_PATH}) — OK"
+  elif [ -n "$traefik_health" ]; then
+    check_warn "Traefik responded but didn't match expected pattern"
+  else
+    check_warn "Traefik path routing — no response (domain routing may still work)"
+  fi
+
+  # -------------------------------------------------------------------------
+  # 5. Domain & SSL (if configured)
+  # -------------------------------------------------------------------------
+  if [ -n "$APP_DOMAIN" ]; then
+    echo ""
+    echo -e "${BOLD}Domain & SSL${NC}"
+
+    # DNS resolution
+    local resolved_ip
+    resolved_ip=$(dig +short "$APP_DOMAIN" 2>/dev/null | head -1)
+    if [ "$resolved_ip" = "$SSH_HOST" ]; then
+      check_pass "DNS: ${APP_DOMAIN} → ${SSH_HOST}"
+    elif [ -n "$resolved_ip" ]; then
+      check_fail "DNS: ${APP_DOMAIN} → ${resolved_ip} (expected ${SSH_HOST})"
+    else
+      check_fail "DNS: ${APP_DOMAIN} does not resolve"
+    fi
+
+    # HTTPS check (from local machine)
+    local https_response
+    https_response=$(curl -sf --max-time 10 "https://${APP_DOMAIN}${HEALTH_PATH}" 2>/dev/null || echo "")
+    if echo "$https_response" | grep -qE "${HEALTH_MATCH}"; then
+      check_pass "HTTPS: https://${APP_DOMAIN}${HEALTH_PATH} — OK"
+    elif [ -n "$https_response" ]; then
+      check_warn "HTTPS: responded but didn't match expected pattern"
+    else
+      check_fail "HTTPS: https://${APP_DOMAIN} — no response (SSL cert or routing issue)"
+    fi
+
+    # SSL certificate check
+    local ssl_expiry
+    ssl_expiry=$(echo | openssl s_client -servername "$APP_DOMAIN" -connect "${APP_DOMAIN}:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+    if [ -n "$ssl_expiry" ]; then
+      check_pass "SSL certificate valid until: ${ssl_expiry}"
+    else
+      check_warn "SSL certificate not available yet"
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # 6. Disk & memory
+  # -------------------------------------------------------------------------
+  echo ""
+  echo -e "${BOLD}Server Resources${NC}"
+
+  local disk_usage
+  disk_usage=$(remote "df -h / | tail -1 | awk '{print \$5}'" || echo "unknown")
+  local disk_pct=${disk_usage%\%}
+  if [ "$disk_pct" -lt 80 ] 2>/dev/null; then
+    check_pass "Disk usage: ${disk_usage}"
+  elif [ "$disk_pct" -lt 90 ] 2>/dev/null; then
+    check_warn "Disk usage: ${disk_usage} (getting full)"
+  else
+    check_fail "Disk usage: ${disk_usage} (critical)"
+  fi
+
+  local mem_info
+  mem_info=$(remote "free -m | awk '/^Mem:/ {printf \"%dMB / %dMB (%d%%)\", \$3, \$2, \$3*100/\$2}'" || echo "unknown")
+  local mem_pct
+  mem_pct=$(echo "$mem_info" | grep -oE '[0-9]+%' | tr -d '%')
+  if [ "$mem_pct" -lt 80 ] 2>/dev/null; then
+    check_pass "Memory: ${mem_info}"
+  elif [ "$mem_pct" -lt 90 ] 2>/dev/null; then
+    check_warn "Memory: ${mem_info} (high)"
+  else
+    check_fail "Memory: ${mem_info} (critical)"
+  fi
+
+  # -------------------------------------------------------------------------
+  # Summary
+  # -------------------------------------------------------------------------
+  echo ""
+  echo -e "${BOLD}─────────────────────────────────${NC}"
+  echo -e "  ${GREEN}✓ ${pass} passed${NC}   ${RED}✗ ${fail} failed${NC}   ${YELLOW}! ${warn_count} warnings${NC}"
+  echo -e "${BOLD}─────────────────────────────────${NC}"
+
+  if [ "$fail" -gt 0 ]; then
+    echo ""
+    echo "  Troubleshoot with:"
+    echo "    ./deploy logs ${ENV_NAME}      View app logs"
+    echo "    ./deploy status ${ENV_NAME}    Container status"
+    echo "    ./deploy ssh ${ENV_NAME}       SSH to server"
+  elif [ "$warn_count" -gt 0 ]; then
+    echo ""
+    echo "  Some warnings — app may still be starting up."
+    echo "  Re-run in a minute: ./deploy check ${ENV_NAME}"
+  else
+    echo ""
+    if [ -n "$APP_DOMAIN" ]; then
+      echo -e "  ${GREEN}All good!${NC} App is live at: https://${APP_DOMAIN}"
+    else
+      echo -e "  ${GREEN}All good!${NC} App is live at: http://${SSH_HOST}/${APP_NAME}/api/v1"
+    fi
+  fi
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: ssh
+# =============================================================================
+
+cmd_ssh() {
+  exec ssh -t "${SSH_USER}@${SSH_HOST}" "cd ${APP_DIR} && exec \$SHELL -l"
+}
+
+# =============================================================================
+# COMMAND: env
+# =============================================================================
+
+cmd_env() {
+  remote_check
+
+  local subcmd="${ENV_SUBCMD:-}"
+
+  if [ -z "$subcmd" ]; then
+    pick_option "Environment variables (${APP_NAME})" \
+      "List          Show all env vars" \
+      "Get           Get a specific var" \
+      "Set           Set or update a var" \
+      "Edit          Open .env in editor" \
+      "Restart       Restart app to apply changes"
+
+    case $MENU_RESULT in
+      1) subcmd="list" ;;
+      2) subcmd="get" ;;
+      3) subcmd="set" ;;
+      4) subcmd="edit" ;;
+      5) subcmd="restart" ;;
+    esac
+  fi
+
+  case "$subcmd" in
+    list)
+      echo ""
+      echo -e "${BOLD}${APP_NAME} — .env${NC}"
+      echo ""
+      remote "cat ${APP_DIR}/.env" | while IFS= read -r line; do
+        if [[ "$line" =~ ^#.* ]]; then
+          echo -e "  ${YELLOW}${line}${NC}"
+        elif [[ "$line" =~ ^[A-Z_]+=.+ ]]; then
+          local key="${line%%=*}"
+          local val="${line#*=}"
+          # Mask secrets
+          if echo "$key" | grep -qiE 'SECRET|PASSWORD|KEY|TOKEN'; then
+            val="${val:0:4}••••"
+          fi
+          echo -e "  ${CYAN}${key}${NC}=${val}"
+        elif [ -n "$line" ]; then
+          echo "  $line"
+        else
+          echo ""
+        fi
+      done
+      echo ""
+      ;;
+
+    get)
+      local key
+      key=$(prompt_required "Variable name")
+      key=$(echo "$key" | tr '[:lower:]' '[:upper:]')
+      local val
+      val=$(remote "grep '^${key}=' ${APP_DIR}/.env | cut -d'=' -f2-")
+      if [ -n "$val" ]; then
+        echo -e "\n  ${CYAN}${key}${NC}=${val}\n"
+      else
+        warn "${key} not found in .env"
+      fi
+      ;;
+
+    set)
+      local key
+      key=$(prompt_required "Variable name")
+      key=$(echo "$key" | tr '[:lower:]' '[:upper:]')
+
+      # Show current value if exists
+      local current
+      current=$(remote "grep '^${key}=' ${APP_DIR}/.env | cut -d'=' -f2-" 2>/dev/null || echo "")
+      if [ -n "$current" ]; then
+        info "Current value: ${current}"
+      fi
+
+      local val
+      val=$(prompt_required "Value for ${key}")
+
+      # Quote if special characters
+      if echo "$val" | grep -qE '[<>|&;()$ ]'; then
+        val="\"${val}\""
+      fi
+
+      # Check if key exists — update or append
+      local exists
+      exists=$(remote "grep -c '^${key}=' ${APP_DIR}/.env" 2>/dev/null || echo "0")
+      if [ "$exists" -gt 0 ]; then
+        remote "sed -i 's|^${key}=.*|${key}=${val}|' ${APP_DIR}/.env"
+        info "Updated ${key}"
+      else
+        remote "echo '${key}=${val}' >> ${APP_DIR}/.env"
+        info "Added ${key}"
+      fi
+
+      echo ""
+      if confirm "Restart app to apply?"; then
+        remote "cd ${APP_DIR} && set -a && source .env && set +a && docker compose -f docker-compose.prod.yml restart app" 2>&1
+        info "App restarted"
+      else
+        warn "Remember to restart: ./deploy restart ${ENV_NAME}"
+      fi
+      ;;
+
+    edit)
+      ssh -t "${SSH_USER}@${SSH_HOST}" "nano ${APP_DIR}/.env || vi ${APP_DIR}/.env"
+      echo ""
+      if confirm "Restart app to apply changes?"; then
+        remote "cd ${APP_DIR} && set -a && source .env && set +a && docker compose -f docker-compose.prod.yml restart app" 2>&1
+        info "App restarted"
+      fi
+      ;;
+
+    restart)
+      info "Restarting ${APP_NAME}..."
+      remote "cd ${APP_DIR} && set -a && source .env && set +a && docker compose -f docker-compose.prod.yml restart app" 2>&1
+      info "Done"
+      ;;
+  esac
+}
+
+# =============================================================================
+# COMMAND: restart
+# =============================================================================
+
+cmd_restart() {
+  remote_check
+  info "Restarting ${APP_NAME}..."
+  remote "cd ${APP_DIR} && set -a && source .env && set +a && docker compose -f docker-compose.prod.yml restart app" 2>&1
+  info "Done"
+}
+
+# =============================================================================
+# Route command
+# =============================================================================
+
+case "$COMMAND" in
+  init)
+    cmd_init
+    ;;
+  setup-github)
+    cmd_setup_github
+    ;;
+  setup-project)
+    cmd_setup_project
+    ;;
+  setup-server)
+    parse_remote
+    echo ""
+    info "Environment: ${ENV_NAME}"
+    info "Server:      ${SSH_USER}@${SSH_HOST}"
+    echo ""
+    cmd_setup_server
+    ;;
+  setup-app)
+    parse_remote
+    echo ""
+    info "Environment: ${ENV_NAME}"
+    info "Server:      ${SSH_USER}@${SSH_HOST}"
+    info "App name:    ${APP_NAME}"
+    [ -n "$APP_DOMAIN" ] && info "Domain:      ${APP_DOMAIN}"
+    echo ""
+    cmd_setup_app
+    ;;
+  deploy)
+    parse_remote
+    echo ""
+    info "Environment: ${ENV_NAME}"
+    info "Server:      ${SSH_USER}@${SSH_HOST}"
+    info "App name:    ${APP_NAME}"
+    [ -n "$APP_DOMAIN" ] && info "Domain:      ${APP_DOMAIN}"
+    echo ""
+    cmd_deploy
+    ;;
+  check)
+    parse_remote
+    cmd_check
+    ;;
+  logs)
+    parse_remote
+    cmd_logs
+    ;;
+  status)
+    parse_remote
+    cmd_status
+    ;;
+  ssh)
+    parse_remote
+    cmd_ssh
+    ;;
+  env)
+    parse_remote
+    # Support ./deploy env set staging KEY=VALUE shorthand
+    ENV_SUBCMD="${3:-}"
+    cmd_env
+    ;;
+  restart)
+    parse_remote
+    cmd_restart
+    ;;
+  *)
+    error "Unknown command: ${COMMAND}"
+    ;;
+esac
