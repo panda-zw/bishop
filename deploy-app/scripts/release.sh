@@ -18,7 +18,8 @@
 #
 # Usage:
 #   ./scripts/release.sh 0.1.1             # arm64 only
-#   ./scripts/release.sh 0.1.1 --intel     # arm64 + x86_64
+#   ./scripts/release.sh 0.1.1 --intel     # arm64 + x86_64 macOS
+#   ./scripts/release.sh 0.1.1 --linux     # + Linux x86_64 (DEB + AppImage) via Docker
 #   ./scripts/release.sh 0.1.1 --draft     # create release as draft
 
 set -euo pipefail
@@ -32,10 +33,12 @@ if [ $# -lt 1 ]; then
 fi
 VERSION="$1"; shift
 WITH_INTEL=0
+WITH_LINUX=0
 DRAFT_FLAG=""
 for arg in "$@"; do
   case "$arg" in
     --intel) WITH_INTEL=1 ;;
+    --linux) WITH_LINUX=1 ;;
     --draft) DRAFT_FLAG="--draft" ;;
     *) echo "unknown flag: $arg" >&2; exit 1 ;;
   esac
@@ -118,17 +121,22 @@ build_one() {
 # Map a Rust triple → Tauri updater platform key.
 tauri_platform() {
   case "$1" in
-    host|aarch64-apple-darwin) echo "darwin-aarch64" ;;
-    x86_64-apple-darwin)       echo "darwin-x86_64" ;;
+    host|aarch64-apple-darwin)  echo "darwin-aarch64" ;;
+    x86_64-apple-darwin)        echo "darwin-x86_64" ;;
+    x86_64-unknown-linux-gnu)   echo "linux-x86_64" ;;
+    aarch64-unknown-linux-gnu)  echo "linux-aarch64" ;;
     *) echo "unknown-$1" ;;
   esac
 }
 
-# Locate the updater artifact for a given target.
+# Locate the updater artifact for a given target. macOS ships a .app.tar.gz
+# in bundle/macos; Linux ships a .AppImage (which IS the updater payload) in
+# bundle/appimage alongside an external .sig.
 updater_artifact_dir() {
   case "$1" in
-    host) echo "src-tauri/target/release/bundle/macos" ;;
-    *)    echo "src-tauri/target/$1/release/bundle/macos" ;;
+    host)                      echo "src-tauri/target/release/bundle/macos" ;;
+    *-apple-darwin)            echo "src-tauri/target/$1/release/bundle/macos" ;;
+    *-unknown-linux-gnu)       echo "src-tauri/target/$1/release/bundle/appimage" ;;
   esac
 }
 
@@ -146,14 +154,16 @@ notarize_dmg() {
 }
 
 # -------- build(s) --------
-# Each target emits: a DMG (user-facing install), and an Updater artifact pair
-# (Bishop.app.tar.gz + Bishop.app.tar.gz.sig) that latest.json references.
+# Each target emits platform-native install artifacts (DMG, DEB, AppImage) and
+# — where Tauri supports updates — a signed update payload referenced by
+# latest.json. Arrays collect everything for a single `gh release create`.
 DMGS=()
+LINUX_INSTALLERS=()
 UPDATE_ASSETS=()
 # Per-platform metadata for building latest.json after all builds finish.
 UPDATE_PLATFORMS=()
 
-collect_one() {
+collect_mac() {
   local target="$1"
   local dmg_glob
   if [ "$target" = "host" ]; then
@@ -187,12 +197,48 @@ collect_one() {
   UPDATE_PLATFORMS+=("$plat|$(basename "$renamed_tar")|$(cat "$renamed_sig")")
 }
 
+collect_linux() {
+  local target="$1"
+  local plat; plat=$(tauri_platform "$target")
+
+  # DEB goes out as-is (no updater support — system packages don't self-update).
+  local deb
+  deb=$(ls -1 src-tauri/target/"$target"/release/bundle/deb/*.deb 2>/dev/null | head -1)
+  if [ -z "$deb" ]; then echo "error: no .deb found for $target" >&2; exit 1; fi
+  LINUX_INSTALLERS+=("$deb")
+
+  # AppImage + external signature form the updater payload for Linux.
+  local up_dir; up_dir=$(updater_artifact_dir "$target")
+  local appimage sig
+  appimage=$(ls -1 "$up_dir"/*.AppImage 2>/dev/null | head -1)
+  sig=$(ls -1 "$up_dir"/*.AppImage.sig 2>/dev/null | head -1)
+  if [ -z "$appimage" ] || [ -z "$sig" ]; then
+    echo "error: AppImage/.sig missing for $target in $up_dir" >&2
+    exit 1
+  fi
+
+  local renamed_app="$up_dir/Bishop_${VERSION}_${plat}.AppImage"
+  local renamed_sig="$renamed_app.sig"
+  [ "$appimage" != "$renamed_app" ] && mv "$appimage" "$renamed_app"
+  [ "$sig"      != "$renamed_sig" ] && mv "$sig"      "$renamed_sig"
+
+  LINUX_INSTALLERS+=("$renamed_app")
+  UPDATE_ASSETS+=("$renamed_sig")
+  UPDATE_PLATFORMS+=("$plat|$(basename "$renamed_app")|$(cat "$renamed_sig")")
+}
+
 build_one host
-collect_one host
+collect_mac host
 
 if [ "$WITH_INTEL" = "1" ]; then
   build_one x86_64-apple-darwin
-  collect_one x86_64-apple-darwin
+  collect_mac x86_64-apple-darwin
+fi
+
+if [ "$WITH_LINUX" = "1" ]; then
+  echo "→ building Linux x86_64 (via Docker)"
+  LINUX_ARCH=x86_64 ./scripts/build-linux.sh
+  collect_linux x86_64-unknown-linux-gnu
 fi
 
 # -------- latest.json --------
@@ -242,12 +288,13 @@ gh release create "$TAG" \
 Download the DMG, double-click, drag Bishop into Applications. No Gatekeeper warnings.
 
 Existing installs auto-update from this release." \
-  "${DMGS[@]}" "${UPDATE_ASSETS[@]}" "$MANIFEST"
+  "${DMGS[@]}" "${LINUX_INSTALLERS[@]}" "${UPDATE_ASSETS[@]}" "$MANIFEST"
 
 rm -rf "$MANIFEST_DIR"
 
 echo ""
 echo "✓ release $TAG published."
 for d in "${DMGS[@]}"; do echo "  • $(basename "$d")"; done
+for d in "${LINUX_INSTALLERS[@]}"; do echo "  • $(basename "$d")"; done
 for u in "${UPDATE_ASSETS[@]}"; do echo "  • $(basename "$u")"; done
 echo "  • latest.json"

@@ -35,8 +35,9 @@ Developer ID credentials (see the comments in the example file).
 
 ```sh
 cd deploy-app
-./scripts/release.sh 0.1.1            # arm64 only
-./scripts/release.sh 0.1.1 --intel    # arm64 + x86_64
+./scripts/release.sh 0.1.1            # macOS arm64 only
+./scripts/release.sh 0.1.1 --intel    # + macOS x86_64
+./scripts/release.sh 0.1.1 --linux    # + Linux x86_64 (.deb + AppImage, via Docker)
 ./scripts/release.sh 0.1.1 --draft    # publish as draft release
 ```
 
