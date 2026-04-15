@@ -7,9 +7,11 @@
 //!
 //! Restart hits the remote directly via SSH, matching the CLI's restart command.
 
+use crate::audit;
 use crate::config::project::load_project;
 use crate::db::Db;
 use crate::deploy_script;
+use crate::errors;
 use crate::ssh;
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -49,16 +51,24 @@ pub async fn start_deploy(
     let stream_id = Uuid::new_v4().to_string();
     let event = format!("deploy:{}", stream_id);
     let done_event = format!("deploy:{}:done", stream_id);
+    let error_event = format!("deploy:{}:error", stream_id);
 
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     streams.inner.lock().insert(stream_id.clone(), cancel_tx);
 
     let started_at = Utc::now();
+    let actor = audit::actor_id();
     let db = app.state::<Db>().inner().clone();
-    let deploy_id = match db.insert_start(&project_path, &env, started_at) {
+    let deploy_id = match db.insert_start(&project_path, &env, started_at, &actor) {
         Ok(id) => Some(id),
         Err(e) => { tracing::warn!("failed to record deploy start: {}", e); None }
     };
+
+    audit::audit("deploy.start", serde_json::json!({
+        "project_path": project_path,
+        "env": env,
+        "deploy_id": deploy_id,
+    }));
 
     let log_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
@@ -139,12 +149,31 @@ pub async fn start_deploy(
         let code = status.and_then(|s| s.code());
         let status_str = if cancelled { "cancelled" } else if ok { "success" } else { "failed" };
 
+        let log = log_buf_c.lock().clone();
         if let Some(id) = deploy_id {
-            let log = log_buf_c.lock().clone();
             if let Err(e) = db.update_finish(id, Utc::now(), status_str, code, &log) {
                 tracing::warn!("failed to record deploy finish: {}", e);
             }
         }
+
+        // Translate raw bash/docker/ssh output into a structured error if we
+        // recognize the failure shape. Emits *before* the `done` event so the
+        // frontend can stage the banner before marking the task finished.
+        if !ok && !cancelled {
+            if let Some(err) = errors::match_error(&log) {
+                audit::audit("deploy.error_matched", serde_json::json!({
+                    "deploy_id": deploy_id,
+                    "code": err.code,
+                }));
+                let _ = app_handle.emit(&error_event, &err);
+            }
+        }
+
+        audit::audit("deploy.finish", serde_json::json!({
+            "deploy_id": deploy_id,
+            "status": status_str,
+            "exit_code": code,
+        }));
 
         notify_deploy_done(&app_handle, &env, status_str);
 

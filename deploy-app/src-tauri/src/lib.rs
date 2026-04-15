@@ -1,7 +1,9 @@
+mod audit;
 mod commands;
 mod config;
 mod db;
 mod deploy_script;
+mod errors;
 mod paths;
 mod ssh;
 mod tray;

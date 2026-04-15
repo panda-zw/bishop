@@ -37,14 +37,26 @@ impl Db {
                 ON deploys(project_path, env, started_at DESC);
             "#,
         )?;
+
+        // Additive migrations. Every future Tier 4 table ("who did this?")
+        // gets an actor_id column; adding it now is free, retrofitting isn't.
+        add_column_if_missing(&conn, "deploys", "actor_id", "TEXT")?;
+
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
-    pub fn insert_start(&self, project_path: &str, env: &str, started_at: DateTime<Utc>) -> Result<i64> {
+    pub fn insert_start(
+        &self,
+        project_path: &str,
+        env: &str,
+        started_at: DateTime<Utc>,
+        actor_id: &str,
+    ) -> Result<i64> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO deploys (project_path, env, started_at, status) VALUES (?1, ?2, ?3, 'running')",
-            params![project_path, env, started_at.to_rfc3339()],
+            "INSERT INTO deploys (project_path, env, started_at, status, actor_id) \
+             VALUES (?1, ?2, ?3, 'running', ?4)",
+            params![project_path, env, started_at.to_rfc3339(), actor_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -94,6 +106,25 @@ impl Db {
         let mut rows = stmt.query(params![id])?;
         if let Some(r) = rows.next()? { Ok(Some(r.get(0)?)) } else { Ok(None) }
     }
+}
+
+/// SQLite doesn't have `ADD COLUMN IF NOT EXISTS`, so inspect the schema
+/// before adding. This is the simplest thing that works for additive
+/// migrations — richer schema versioning lands in v0.2 per BUILD_ORDER.md#7.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, type_decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == column);
+    drop(stmt);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, type_decl),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Clone)]

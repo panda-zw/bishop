@@ -34,6 +34,9 @@ base64 = "0.22"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 portable-pty = "0.8"
+regex = "1"
+whoami = "1"
+once_cell = "1"
 
 [features]
 default = ["custom-protocol"]
