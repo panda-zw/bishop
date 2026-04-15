@@ -32,8 +32,11 @@
   type Step = 1 | 2 | 3 | 4 | 5;
   let step = $state<Step>(1);
 
-  // Step 2 — project
+  // Step 2 — project. Users either pick an existing folder or clone our starter.
   let projectPath = $state("");
+  let cloning = $state(false);
+  let cloneError = $state<string | null>(null);
+  let usedStarter = $state(false);
 
   // Step 3 — server + SSH test
   let sshUser = $state("root");
@@ -79,7 +82,34 @@
   async function pickDir() {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const p = await open({ directory: true, multiple: false });
-    if (typeof p === "string") projectPath = p;
+    if (typeof p === "string") { projectPath = p; usedStarter = false; }
+  }
+
+  /// Clone the Bishop starter into a user-picked parent folder. Defaults the
+  /// folder name so users who just want to try it out don't have to think.
+  async function useStarter() {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const parent = await open({
+      directory: true,
+      multiple: false,
+      title: "Where should Bishop put the starter project?",
+    });
+    if (typeof parent !== "string") return;
+
+    cloning = true;
+    cloneError = null;
+    try {
+      projectPath = await api.cloneSample(parent, "bishop-starter-nextjs");
+      usedStarter = true;
+      // Opinionated defaults for the starter so the rest of the wizard
+      // is "press Continue four times" when trying it.
+      if (!appName) appName = "bishop-starter";
+      appPort = 3000;
+    } catch (e) {
+      cloneError = String(e);
+    } finally {
+      cloning = false;
+    }
   }
 
   // ---------- step 3 ----------
@@ -238,22 +268,43 @@
     {#if step === 2}
       <div class="space-y-4 text-sm">
         <p class="text-muted">
-          Choose the folder containing your app's source. Bishop will write its config to
-          <span class="font-mono text-foreground">.deploy/</span> inside that folder.
+          Point Bishop at a folder with your app's source — or clone our Next.js starter
+          if you just want to try the flow end-to-end.
         </p>
+
         <Field label="Project folder">
           <div class="flex gap-2">
             <Input class="font-mono" placeholder="/path/to/your/project" bind:value={projectPath} />
-            <Button size="md" variant="outline" onclick={pickDir}>Choose…</Button>
+            <Button size="md" variant="outline" onclick={pickDir} disabled={cloning}>Choose…</Button>
           </div>
         </Field>
-        <div class="rounded-md border border-border border-dashed px-4 py-3">
-          <div class="text-xs font-semibold uppercase tracking-wider text-muted mb-1">Don't have a project yet?</div>
-          <div class="text-xs text-muted">
-            A "Try with a sample Next.js app" flow is coming in a future release. For now,
-            bring your own codebase — any Dockerfile-able app works.
+
+        {#if usedStarter && projectPath}
+          <div class="text-xs text-ok flex items-center gap-1.5">
+            <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+            Starter cloned into <span class="font-mono text-foreground">{projectPath}</span>
           </div>
+        {/if}
+
+        <div class="rounded-md border border-border border-dashed px-4 py-3 flex items-start gap-3">
+          <div class="flex-1">
+            <div class="text-xs font-semibold uppercase tracking-wider text-muted mb-1">Don't have a project yet?</div>
+            <div class="text-xs text-muted">
+              Clone the Next.js starter — a tiny app with a working Dockerfile and a
+              <span class="font-mono text-foreground">/api/health</span> endpoint pre-wired for Bishop.
+            </div>
+          </div>
+          <Button size="sm" variant="outline" onclick={useStarter} disabled={cloning}>
+            {cloning ? "Cloning…" : "Use the starter"}
+          </Button>
         </div>
+
+        {#if cloneError}
+          <div class="rounded-md border border-err/40 bg-err/5 px-4 py-3 text-xs">
+            <div class="font-medium text-foreground mb-1">Couldn't clone the starter</div>
+            <pre class="font-mono text-muted whitespace-pre-wrap">{cloneError}</pre>
+          </div>
+        {/if}
       </div>
     {/if}
 

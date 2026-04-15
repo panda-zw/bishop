@@ -56,6 +56,8 @@ export const api = {
     invoke<void>("stop_metrics", { streamId }),
   testSsh: (user: string, host: string) =>
     invoke<SshTestResult>("test_ssh", { user, host }),
+  cloneSample: (destParent: string, folderName: string) =>
+    invoke<string>("clone_sample", { destParent, folderName }),
   opStatus: () => invoke<{ installed: boolean; signed_in: boolean }>("op_status"),
   opRead: (reference: string) => invoke<string>("op_read", { reference }),
   initProject: (input: InitProjectInput) => invoke<Project>("init_project", { input }),
