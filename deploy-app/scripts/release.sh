@@ -101,17 +101,17 @@ PY
 (cd src-tauri && cargo generate-lockfile >/dev/null 2>&1 || cargo metadata --format-version 1 >/dev/null)
 
 # -------- build helper --------
-# Building with `--bundles dmg,updater` produces both the user-facing DMG and
+# Building with `--bundles app,dmg` produces both the user-facing DMG and
 # the Tauri updater artifact (Bishop.app.tar.gz + .sig) that latest.json points
 # at. Skipping the updater bundle here would silently break auto-update.
 build_one() {
   local target="$1"
   echo "→ building $target"
   if [ "$target" = "host" ]; then
-    pnpm tauri build --bundles dmg,updater
+    pnpm tauri build --bundles app,dmg
   else
     rustup target list --installed | grep -q "^$target\$" || rustup target add "$target"
-    pnpm tauri build --target "$target" --bundles dmg,updater
+    pnpm tauri build --target "$target" --bundles app,dmg
   fi
 }
 
