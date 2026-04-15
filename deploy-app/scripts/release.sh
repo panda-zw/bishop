@@ -199,7 +199,11 @@ fi
 # Tauri's updater fetches this URL, compares versions, and downloads the
 # matching platform's tarball. GitHub Releases hosts it as a static asset,
 # reachable at https://github.com/<owner>/<repo>/releases/latest/download/latest.json.
-MANIFEST=/tmp/bishop-latest-$VERSION.json
+# Must literally be named latest.json — the updater fetches
+# releases/latest/download/latest.json, and gh keeps the uploaded file's
+# basename as the asset name (# syntax only sets a display label).
+MANIFEST_DIR=$(mktemp -d -t bishop-release)
+MANIFEST="$MANIFEST_DIR/latest.json"
 PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 RELEASE_URL_BASE="https://github.com/panda-zw/bishop/releases/download/$TAG"
 
@@ -238,9 +242,9 @@ gh release create "$TAG" \
 Download the DMG, double-click, drag Bishop into Applications. No Gatekeeper warnings.
 
 Existing installs auto-update from this release." \
-  "${DMGS[@]}" "${UPDATE_ASSETS[@]}" "$MANIFEST#latest.json"
+  "${DMGS[@]}" "${UPDATE_ASSETS[@]}" "$MANIFEST"
 
-rm -f "$MANIFEST"
+rm -rf "$MANIFEST_DIR"
 
 echo ""
 echo "✓ release $TAG published."
