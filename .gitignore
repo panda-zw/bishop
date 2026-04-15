@@ -1,0 +1,45 @@
+# System
+.DS_Store
+Thumbs.db
+
+# Editors / tooling / agents
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node / pnpm
+**/node_modules/
+pnpm-debug.log
+npm-debug.log
+yarn-error.log
+
+# Build output
+**/dist/
+**/target/
+**/src-tauri/gen/
+
+# Tauri runtime artifacts
+**/src-tauri/WixTools/
+
+# Env + secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# Local data / caches
+.deploy/remotes/
+.deploy/.cache/
+**/*.sqlite
+**/*.sqlite-journal
+**/*.db
+
+# Docs — only README ships. Everything else is workspace notes.
+*.md
+!README.md
+!**/README.md
