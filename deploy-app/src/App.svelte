@@ -177,6 +177,7 @@
     out.push(
       { id: "settings", label: "Settings", group: "app", run: () => dashActions.openSettings() },
       { id: "init", label: "Setup new project", group: "app", run: () => dashActions.openInit() },
+      { id: "onboarding", label: "Take the onboarding tour", group: "app", run: () => { dashActions.showOnboarding = true; } },
     );
 
     // Local terminal actions — always first in the terminals group.

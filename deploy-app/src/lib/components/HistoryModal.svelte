@@ -2,6 +2,9 @@
   import { api } from "../api";
   import type { DeployRow } from "../types";
   import Modal from "./Modal.svelte";
+  import Skeleton from "./ui/Skeleton.svelte";
+  import Button from "./ui/Button.svelte";
+  import { dashActions } from "../stores.svelte";
 
   interface Props {
     projectPath: string;
@@ -73,11 +76,38 @@
   <div class="flex h-[65vh]">
     <div class="w-1/2 overflow-auto border-r border-border">
       {#if loading}
-        <div class="p-5 text-xs text-muted">Loading…</div>
+        <div class="divide-y divide-border" aria-busy="true" aria-label="Loading deploy history">
+          {#each Array(4) as _, i (i)}
+            <div class="px-4 py-3 space-y-2">
+              <div class="flex items-center justify-between gap-2">
+                <Skeleton class="h-3.5 w-36" />
+                <Skeleton class="h-3 w-14" />
+              </div>
+              <div class="flex gap-3">
+                <Skeleton class="h-3 w-10" />
+              </div>
+            </div>
+          {/each}
+        </div>
       {:else if error}
         <div class="p-5 text-xs text-err font-mono">{error}</div>
       {:else if rows.length === 0}
-        <div class="p-5 text-xs text-muted">No deploys yet.</div>
+        <div class="flex flex-col items-center text-center p-8 gap-3">
+          <div class="w-10 h-10 rounded-lg border border-border bg-card flex items-center justify-center">
+            <svg viewBox="0 0 24 24" class="w-5 h-5 text-muted" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"/>
+            </svg>
+          </div>
+          <div class="space-y-1">
+            <div class="text-sm font-medium">No deploys yet</div>
+            <p class="text-xs text-muted leading-relaxed max-w-[240px]">
+              Once you deploy this environment, every run will appear here with its logs.
+            </p>
+          </div>
+          <Button size="sm" onclick={() => { onClose(); dashActions.deploy(); }}>
+            Deploy {env}
+          </Button>
+        </div>
       {:else}
         {#each rows as row (row.id)}
           <button

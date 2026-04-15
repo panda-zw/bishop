@@ -105,24 +105,46 @@
 </script>
 
 {#if !app.activeProject || !app.activeEnv}
+  {@const firstTime = app.projects.length === 0}
   <div class="flex-1 flex items-center justify-center p-10">
-    <div class="max-w-sm text-center space-y-5">
-      <div class="mx-auto w-12 h-12 rounded-lg border border-border bg-card flex items-center justify-center">
-        <svg viewBox="0 0 24 24" class="w-6 h-6 text-muted" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+    <div class="max-w-md text-center space-y-6">
+      <div class="mx-auto w-14 h-14 rounded-xl border border-border bg-card flex items-center justify-center shadow-sm">
+        <svg viewBox="0 0 24 24" class="w-7 h-7 text-primary" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
           <path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5l9-4.5 9 4.5M3 7.5l9 4.5 9-4.5M3 7.5v9l9 4.5M21 7.5v9l-9 4.5M12 12v9"/>
         </svg>
       </div>
-      <div class="space-y-1.5">
-        <h2 class="text-base font-semibold">No project selected</h2>
+      <div class="space-y-2">
+        <h2 class="text-lg font-semibold tracking-tight">
+          {firstTime ? "Welcome to Bishop" : "Select a project"}
+        </h2>
         <p class="text-sm text-muted leading-relaxed">
-          Add a project folder containing <span class="font-mono text-foreground">.deploy/</span>,
-          or set one up from scratch.
+          {#if firstTime}
+            Bishop deploys your apps to servers you own. Take the 5-step tour to ship a
+            sample Next.js app in about 15 minutes — or add an existing project if you
+            already have one.
+          {:else}
+            Pick a project from the sidebar, or add another one.
+          {/if}
         </p>
       </div>
-      <div class="flex justify-center gap-2">
-        <Button size="sm" onclick={() => dashActions.openInit()}>Setup new project</Button>
-        <Button size="sm" variant="outline" onclick={() => dashActions.openSettings()}>Open settings</Button>
+      <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-center gap-2">
+        {#if firstTime}
+          <Button size="md" onclick={() => (dashActions.showOnboarding = true)}>
+            Take the tour
+          </Button>
+          <Button size="md" variant="outline" onclick={() => dashActions.openInit()}>
+            I have an existing project
+          </Button>
+        {:else}
+          <Button size="md" onclick={() => dashActions.openInit()}>Add another project</Button>
+          <Button size="md" variant="outline" onclick={() => dashActions.openSettings()}>Open settings</Button>
+        {/if}
       </div>
+      {#if firstTime}
+        <p class="text-[11px] text-muted">
+          You can re-open the tour any time from the command palette (⌘K).
+        </p>
+      {/if}
     </div>
   </div>
 {:else}

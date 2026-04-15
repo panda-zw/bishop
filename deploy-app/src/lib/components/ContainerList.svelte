@@ -1,6 +1,9 @@
 <script lang="ts">
   import StatusDot from "./StatusDot.svelte";
   import Skeleton from "./ui/Skeleton.svelte";
+  import Button from "./ui/Button.svelte";
+  import { dashActions } from "../stores.svelte";
+  import { tasks } from "../tasks.svelte";
   import type { Container } from "../types";
 
   interface Props {
@@ -14,6 +17,12 @@
   let {
     containers, selected, loading = false, onToggle, onRestart, restartingName = null,
   }: Props = $props();
+
+  // A deploy that's mid-flight changes the meaning of "empty" — not "broken",
+  // just "containers will show up in ~60s". Check the task store directly.
+  const deployInFlight = $derived(
+    tasks.running.some(t => t.kind === "deploy")
+  );
 </script>
 
 <div class="border border-border rounded-lg overflow-hidden divide-y divide-border bg-card">
@@ -64,12 +73,33 @@
         {/if}
       </div>
     {:else}
-      <div class="px-4 py-6 text-center space-y-1">
-        <div class="text-sm text-foreground">No containers found</div>
-        <div class="text-xs text-muted">
-          The app may not be deployed yet. Try <span class="font-mono text-foreground">Deploy</span> or <span class="font-mono text-foreground">Check</span>.
+      {#if deployInFlight}
+        <div class="flex flex-col items-center text-center px-4 py-8 gap-3">
+          <div class="w-8 h-8 rounded-full border-2 border-border border-t-primary animate-spin" aria-hidden="true"></div>
+          <div class="space-y-1">
+            <div class="text-sm font-medium">Deploy in progress</div>
+            <div class="text-xs text-muted max-w-[260px] leading-relaxed">
+              Containers will appear here once the server reports them running.
+              Watch the live log in the deploy modal.
+            </div>
+          </div>
         </div>
-      </div>
+      {:else}
+        <div class="flex flex-col items-center text-center px-4 py-8 gap-3">
+          <div class="w-8 h-8 rounded-lg border border-border bg-background flex items-center justify-center">
+            <svg viewBox="0 0 24 24" class="w-4 h-4 text-muted" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M20 7 12 3 4 7m16 0-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>
+            </svg>
+          </div>
+          <div class="space-y-1">
+            <div class="text-sm font-medium">No deploys yet on this environment</div>
+            <div class="text-xs text-muted max-w-[260px] leading-relaxed">
+              Once you deploy, every container running on the server will show up here with live status + logs.
+            </div>
+          </div>
+          <Button size="sm" onclick={() => dashActions.deploy()}>Deploy now</Button>
+        </div>
+      {/if}
     {/each}
   {/if}
 </div>
