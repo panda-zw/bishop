@@ -2,6 +2,7 @@
   import { tasks, type Task } from "../tasks.svelte";
   import Modal from "./Modal.svelte";
   import Button from "./ui/Button.svelte";
+  import ErrorBanner from "./ErrorBanner.svelte";
 
   let viewport: HTMLDivElement | null = $state(null);
   let shouldAutoscroll = $state(true);
@@ -47,6 +48,9 @@
     </div>
     {#if t.description}
       <div class="px-5 pt-3 text-xs text-muted">{t.description}</div>
+    {/if}
+    {#if t.bishopError}
+      <ErrorBanner error={t.bishopError} />
     {/if}
     <div
       bind:this={viewport}

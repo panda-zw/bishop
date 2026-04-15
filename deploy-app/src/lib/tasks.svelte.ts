@@ -7,9 +7,10 @@
  * accumulating lines and can be re-attached to its modal later.
  */
 
-import { api, onDeployLine, onDeployDone, onHealthLine, onHealthDone, onStepLine, onStepDone } from "./api";
+import { api, onDeployLine, onDeployDone, onDeployError, onHealthLine, onHealthDone, onStepLine, onStepDone } from "./api";
 import { toast } from "./toast.svelte";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { BishopError } from "./types";
 
 export type TaskKind = "deploy" | "check" | "step";
 export type TaskStatus = "running" | "success" | "failed" | "cancelled";
@@ -26,6 +27,9 @@ export interface Task {
   status: TaskStatus;
   exitCode: number | null;
   lines: string[];
+  /// Structured error if the backend matched one from the catalog. Rendered
+  /// as a banner above the raw log.
+  bishopError: BishopError | null;
   startedAt: number;
   finishedAt: number | null;
 }
@@ -35,6 +39,7 @@ const MAX_LINES = 5000;
 interface Listeners {
   line: UnlistenFn | null;
   done: UnlistenFn | null;
+  error?: UnlistenFn | null;
 }
 
 function createTasks() {
@@ -78,11 +83,12 @@ function createTasks() {
     if (!l) return;
     try { l.line?.(); } catch {}
     try { l.done?.(); } catch {}
+    try { l.error?.(); } catch {}
     listeners.delete(id);
   }
 
   function createTask(
-    partial: Omit<Task, "id" | "status" | "exitCode" | "lines" | "startedAt" | "finishedAt">,
+    partial: Omit<Task, "id" | "status" | "exitCode" | "lines" | "bishopError" | "startedAt" | "finishedAt">,
   ): Task {
     const id = `task-${++seq}`;
     const task: Task = {
@@ -91,6 +97,7 @@ function createTasks() {
       status: "running",
       exitCode: null,
       lines: [],
+      bishopError: null,
       startedAt: Date.now(),
       finishedAt: null,
     };
@@ -99,11 +106,25 @@ function createTasks() {
     return task;
   }
 
-  async function attach(id: string, fns: { onLine: () => Promise<UnlistenFn>; onDone: () => Promise<UnlistenFn> }) {
-    const l: Listeners = { line: null, done: null };
+  function setBishopError(id: string, err: BishopError) {
+    const i = state.items.findIndex(t => t.id === id);
+    if (i < 0) return;
+    state.items[i] = { ...state.items[i], bishopError: err };
+  }
+
+  async function attach(
+    id: string,
+    fns: {
+      onLine: () => Promise<UnlistenFn>;
+      onDone: () => Promise<UnlistenFn>;
+      onError?: () => Promise<UnlistenFn>;
+    },
+  ) {
+    const l: Listeners = { line: null, done: null, error: null };
     listeners.set(id, l);
     l.line = await fns.onLine();
     l.done = await fns.onDone();
+    if (fns.onError) l.error = await fns.onError();
   }
 
   function toastOnFinish(id: string) {
@@ -165,6 +186,7 @@ function createTasks() {
       attach(task.id, {
         onLine: () => onDeployLine(streamId, (l) => pushLine(task.id, l)),
         onDone: () => onDeployDone(streamId, (r) => finishTask(task.id, r)),
+        onError: () => onDeployError(streamId, (err) => setBishopError(task.id, err)),
       });
       toastOnFinish(task.id);
       return task.id;

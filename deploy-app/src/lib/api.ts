@@ -150,6 +150,13 @@ export async function onDeployDone(
   return listen<DeployDone>(`deploy:${streamId}:done`, (e) => cb(e.payload));
 }
 
+export async function onDeployError(
+  streamId: string,
+  cb: (err: import("./types").BishopError) => void,
+): Promise<UnlistenFn> {
+  return listen<import("./types").BishopError>(`deploy:${streamId}:error`, (e) => cb(e.payload));
+}
+
 export async function onHealthLine(
   streamId: string,
   cb: (line: string) => void,

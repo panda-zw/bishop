@@ -1,5 +1,22 @@
 export type ConnectionState = "connected" | "disconnected" | "connecting" | "error";
 
+/// Structured failure produced by the error catalog. The UI renders message +
+/// hint and optionally a single action button (retry, open scaffold, etc).
+export interface BishopError {
+  code: string;
+  message: string;
+  hint?: string | null;
+  docs_url?: string | null;
+  action?: BishopAction | null;
+  raw?: string | null;
+}
+
+export interface BishopAction {
+  label: string;
+  kind: "open_url" | "retry" | "open_scaffold" | "copy" | "run_step" | string;
+  payload?: string | null;
+}
+
 export interface Project {
   path: string;
   name: string;
