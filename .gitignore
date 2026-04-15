@@ -27,6 +27,8 @@ yarn-error.log
 .env
 .env.*
 !.env.example
+!.env.*.example
+!*.env.example
 *.pem
 *.key
 id_rsa*
@@ -39,7 +41,11 @@ id_ed25519*
 **/*.sqlite-journal
 **/*.db
 
-# Docs — only README ships. Everything else is workspace notes.
+# Docs — only README + .github/ setup docs ship. Everything else is workspace notes.
 *.md
 !README.md
 !**/README.md
+!.github/**/*.md
+
+# Signing secrets
+deploy-app/.env.signing
