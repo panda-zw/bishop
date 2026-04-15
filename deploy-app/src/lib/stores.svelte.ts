@@ -146,6 +146,7 @@ function createDashActions() {
     showHistory: false,
     showSettings: false,
     showInit: false,
+    showOnboarding: false,
     showEditRemote: false,
     showScaffold: false,
     scaffoldInitialTab: "compose" as
@@ -166,6 +167,9 @@ function createDashActions() {
 
     get showInit() { return state.showInit; },
     set showInit(v: boolean) { state.showInit = v; },
+
+    get showOnboarding() { return state.showOnboarding; },
+    set showOnboarding(v: boolean) { state.showOnboarding = v; },
 
     get showEditRemote() { return state.showEditRemote; },
     set showEditRemote(v: boolean) { state.showEditRemote = v; },

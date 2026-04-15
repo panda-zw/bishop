@@ -13,3 +13,4 @@ pub mod step;
 pub mod hosts;
 pub mod scrollback;
 pub mod scaffold;
+pub mod ssh_test;

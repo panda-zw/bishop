@@ -2,8 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Project, Container, EnvLine, DeployDone, DeployRow,
-  TerminalTarget, SavedHost, SshConfigHost,
+  TerminalTarget, SavedHost, SshConfigHost, BishopError,
 } from "./types";
+
+export interface SshTestResult {
+  ok: boolean;
+  message: string | null;
+  error: BishopError | null;
+  raw: string | null;
+}
 
 export const api = {
   addProject: (path: string) => invoke<Project>("add_project", { path }),
@@ -47,6 +54,8 @@ export const api = {
     invoke<string>("start_metrics", { projectPath, env }),
   stopMetrics: (streamId: string) =>
     invoke<void>("stop_metrics", { streamId }),
+  testSsh: (user: string, host: string) =>
+    invoke<SshTestResult>("test_ssh", { user, host }),
   opStatus: () => invoke<{ installed: boolean; signed_in: boolean }>("op_status"),
   opRead: (reference: string) => invoke<string>("op_read", { reference }),
   initProject: (input: InitProjectInput) => invoke<Project>("init_project", { input }),

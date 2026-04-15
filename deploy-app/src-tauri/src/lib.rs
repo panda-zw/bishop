@@ -115,6 +115,7 @@ pub fn run() {
             tray::set_tray_tooltip,
             deploy_script::install_deploy_script,
             deploy_script::has_local_deploy_script,
+            commands::ssh_test::test_ssh,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

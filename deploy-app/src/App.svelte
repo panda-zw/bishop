@@ -4,6 +4,7 @@
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import SettingsModal from "./lib/components/SettingsModal.svelte";
   import InitWizard from "./lib/components/InitWizard.svelte";
+  import OnboardingWizard from "./lib/components/OnboardingWizard.svelte";
   import Toaster from "./lib/components/Toaster.svelte";
   import ConfirmDialog from "./lib/components/ConfirmDialog.svelte";
   import TaskModal from "./lib/components/TaskModal.svelte";
@@ -45,6 +46,9 @@
       try {
         app.projects = await api.listProjects();
         if (app.projects[0]) app.selectProject(app.projects[0]);
+        // First-run: no projects ever configured → open onboarding. The user
+        // can always dismiss via "Skip for now" and reopen from Settings.
+        if (app.projects.length === 0) dashActions.showOnboarding = true;
       } catch (e) { console.error(e); }
       app.probeAll();
       probeHandle = setInterval(() => app.probeAll(), 30000);
@@ -253,4 +257,8 @@
 
 {#if dashActions.showInit}
   <InitWizard onClose={() => (dashActions.showInit = false)} />
+{/if}
+
+{#if dashActions.showOnboarding}
+  <OnboardingWizard onClose={() => (dashActions.showOnboarding = false)} />
 {/if}
