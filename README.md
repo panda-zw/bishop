@@ -27,6 +27,23 @@ pnpm tauri build --bundles dmg   # build a macOS DMG
 
 The built DMG lands in `deploy-app/src-tauri/target/release/bundle/dmg/`.
 
+## Cutting a release
+
+Releases are built and signed locally (no CI). One-time setup: copy
+`deploy-app/.env.signing.example` → `deploy-app/.env.signing` and fill in your Apple
+Developer ID credentials (see the comments in the example file).
+
+```sh
+cd deploy-app
+./scripts/release.sh 0.1.1            # arm64 only
+./scripts/release.sh 0.1.1 --intel    # arm64 + x86_64
+./scripts/release.sh 0.1.1 --draft    # publish as draft release
+```
+
+The script bumps the version in all manifests, builds + signs + notarizes the DMG
+(including the outer DMG wrapper, which `tauri build` alone skips), tags the commit,
+pushes, and creates the GitHub Release with the DMG attached.
+
 ## Features
 
 - **Multi-tab terminals** — SSH (via your system `ssh` + `~/.ssh/config`, with ControlMaster
