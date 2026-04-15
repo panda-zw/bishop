@@ -1,5 +1,10 @@
 //! SQLite-backed deploy history. Single connection guarded by a Mutex —
 //! write throughput is trivial (one row per deploy) so contention is a non-issue.
+//!
+//! Schema lives in [`migrations`]; this module owns the runtime connection +
+//! query helpers.
+
+mod migrations;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -21,27 +26,7 @@ fn db_path() -> Result<PathBuf> {
 impl Db {
     pub fn open() -> Result<Self> {
         let conn = Connection::open(db_path()?)?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS deploys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_path TEXT NOT NULL,
-                env TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                status TEXT NOT NULL,
-                exit_code INTEGER,
-                log TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS deploys_project_env
-                ON deploys(project_path, env, started_at DESC);
-            "#,
-        )?;
-
-        // Additive migrations. Every future Tier 4 table ("who did this?")
-        // gets an actor_id column; adding it now is free, retrofitting isn't.
-        add_column_if_missing(&conn, "deploys", "actor_id", "TEXT")?;
-
+        migrations::run(&conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -106,25 +91,6 @@ impl Db {
         let mut rows = stmt.query(params![id])?;
         if let Some(r) = rows.next()? { Ok(Some(r.get(0)?)) } else { Ok(None) }
     }
-}
-
-/// SQLite doesn't have `ADD COLUMN IF NOT EXISTS`, so inspect the schema
-/// before adding. This is the simplest thing that works for additive
-/// migrations — richer schema versioning lands in v0.2 per BUILD_ORDER.md#7.
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, type_decl: &str) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
-    let exists = stmt
-        .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .any(|name| name == column);
-    drop(stmt);
-    if !exists {
-        conn.execute(
-            &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, type_decl),
-            [],
-        )?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Serialize, Clone)]
