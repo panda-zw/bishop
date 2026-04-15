@@ -53,9 +53,19 @@ if [ ! -f .env.signing ]; then
   exit 1
 fi
 set -a; source .env.signing; set +a
-for v in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_PASSWORD; do
+for v in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_PASSWORD \
+         TAURI_SIGNING_PRIVATE_KEY_PATH TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
   if [ -z "${!v:-}" ]; then echo "error: $v not set in .env.signing" >&2; exit 1; fi
 done
+# Tauri reads TAURI_SIGNING_PRIVATE_KEY (inline) OR ..._PATH. Resolve the path
+# and expose the content; covers either usage.
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  KEY_PATH=$(eval echo "$TAURI_SIGNING_PRIVATE_KEY_PATH")
+  if [ ! -f "$KEY_PATH" ]; then
+    echo "error: updater private key not found at $KEY_PATH" >&2; exit 1
+  fi
+  export TAURI_SIGNING_PRIVATE_KEY=$(cat "$KEY_PATH")
+fi
 
 # Must be on main with a clean tree so the version-bump commit lands where we expect.
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
@@ -91,15 +101,35 @@ PY
 (cd src-tauri && cargo generate-lockfile >/dev/null 2>&1 || cargo metadata --format-version 1 >/dev/null)
 
 # -------- build helper --------
+# Building with `--bundles dmg,updater` produces both the user-facing DMG and
+# the Tauri updater artifact (Bishop.app.tar.gz + .sig) that latest.json points
+# at. Skipping the updater bundle here would silently break auto-update.
 build_one() {
   local target="$1"
   echo "→ building $target"
   if [ "$target" = "host" ]; then
-    pnpm tauri build --bundles dmg
+    pnpm tauri build --bundles dmg,updater
   else
     rustup target list --installed | grep -q "^$target\$" || rustup target add "$target"
-    pnpm tauri build --target "$target" --bundles dmg
+    pnpm tauri build --target "$target" --bundles dmg,updater
   fi
+}
+
+# Map a Rust triple → Tauri updater platform key.
+tauri_platform() {
+  case "$1" in
+    host|aarch64-apple-darwin) echo "darwin-aarch64" ;;
+    x86_64-apple-darwin)       echo "darwin-x86_64" ;;
+    *) echo "unknown-$1" ;;
+  esac
+}
+
+# Locate the updater artifact for a given target.
+updater_artifact_dir() {
+  case "$1" in
+    host) echo "src-tauri/target/release/bundle/macos" ;;
+    *)    echo "src-tauri/target/$1/release/bundle/macos" ;;
+  esac
 }
 
 # Notarize the DMG wrapper (Tauri notarizes the .app but not the .dmg).
@@ -116,18 +146,80 @@ notarize_dmg() {
 }
 
 # -------- build(s) --------
+# Each target emits: a DMG (user-facing install), and an Updater artifact pair
+# (Bishop.app.tar.gz + Bishop.app.tar.gz.sig) that latest.json references.
 DMGS=()
+UPDATE_ASSETS=()
+# Per-platform metadata for building latest.json after all builds finish.
+UPDATE_PLATFORMS=()
+
+collect_one() {
+  local target="$1"
+  local dmg_glob
+  if [ "$target" = "host" ]; then
+    dmg_glob="src-tauri/target/release/bundle/dmg/Bishop_${VERSION}_*.dmg"
+  else
+    dmg_glob="src-tauri/target/$target/release/bundle/dmg/Bishop_${VERSION}_*.dmg"
+  fi
+  local dmg
+  dmg=$(ls -1 $dmg_glob | head -1)
+  if [ -z "$dmg" ]; then echo "error: no DMG found for $target" >&2; exit 1; fi
+  notarize_dmg "$dmg"
+  DMGS+=("$dmg")
+
+  local up_dir; up_dir=$(updater_artifact_dir "$target")
+  local sig tar
+  tar=$(ls -1 "$up_dir"/Bishop.app.tar.gz 2>/dev/null | head -1)
+  sig=$(ls -1 "$up_dir"/Bishop.app.tar.gz.sig 2>/dev/null | head -1)
+  if [ -z "$tar" ] || [ -z "$sig" ]; then
+    echo "error: updater artifact missing for $target (expected Bishop.app.tar.gz[.sig] in $up_dir)" >&2
+    exit 1
+  fi
+
+  # Rename to avoid collision when both arm64 + x86_64 ship in the same release.
+  local plat; plat=$(tauri_platform "$target")
+  local renamed_tar="$up_dir/Bishop_${VERSION}_${plat}.app.tar.gz"
+  local renamed_sig="$renamed_tar.sig"
+  mv "$tar" "$renamed_tar"
+  mv "$sig" "$renamed_sig"
+
+  UPDATE_ASSETS+=("$renamed_tar" "$renamed_sig")
+  UPDATE_PLATFORMS+=("$plat|$(basename "$renamed_tar")|$(cat "$renamed_sig")")
+}
+
 build_one host
-HOST_DMG=$(ls -1 src-tauri/target/release/bundle/dmg/Bishop_${VERSION}_*.dmg | head -1)
-notarize_dmg "$HOST_DMG"
-DMGS+=("$HOST_DMG")
+collect_one host
 
 if [ "$WITH_INTEL" = "1" ]; then
   build_one x86_64-apple-darwin
-  INTEL_DMG=$(ls -1 src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Bishop_${VERSION}_*.dmg | head -1)
-  notarize_dmg "$INTEL_DMG"
-  DMGS+=("$INTEL_DMG")
+  collect_one x86_64-apple-darwin
 fi
+
+# -------- latest.json --------
+# Tauri's updater fetches this URL, compares versions, and downloads the
+# matching platform's tarball. GitHub Releases hosts it as a static asset,
+# reachable at https://github.com/<owner>/<repo>/releases/latest/download/latest.json.
+MANIFEST=/tmp/bishop-latest-$VERSION.json
+PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+RELEASE_URL_BASE="https://github.com/panda-zw/bishop/releases/download/$TAG"
+
+# Build the platforms map with jq so embedded signatures don't break JSON.
+PLATFORMS_JSON='{}'
+for entry in "${UPDATE_PLATFORMS[@]}"; do
+  IFS='|' read -r plat fname sig_content <<< "$entry"
+  PLATFORMS_JSON=$(jq --arg p "$plat" \
+                     --arg url "$RELEASE_URL_BASE/$fname" \
+                     --arg sig "$sig_content" \
+                     '. + { ($p): { signature: $sig, url: $url } }' \
+                     <<< "$PLATFORMS_JSON")
+done
+jq -n \
+  --arg version "$VERSION" \
+  --arg notes "Bishop $TAG" \
+  --arg pub_date "$PUB_DATE" \
+  --argjson platforms "$PLATFORMS_JSON" \
+  '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms }' \
+  > "$MANIFEST"
 
 # -------- commit + tag + release --------
 echo "→ committing version bump"
@@ -145,9 +237,13 @@ gh release create "$TAG" \
 
 Download the DMG, double-click, drag Bishop into Applications. No Gatekeeper warnings.
 
-See [CHANGELOG](../../compare/v0.1.0...$TAG) for what's new." \
-  "${DMGS[@]}"
+Existing installs auto-update from this release." \
+  "${DMGS[@]}" "${UPDATE_ASSETS[@]}" "$MANIFEST#latest.json"
+
+rm -f "$MANIFEST"
 
 echo ""
 echo "✓ release $TAG published."
 for d in "${DMGS[@]}"; do echo "  • $(basename "$d")"; done
+for u in "${UPDATE_ASSETS[@]}"; do echo "  • $(basename "$u")"; done
+echo "  • latest.json"

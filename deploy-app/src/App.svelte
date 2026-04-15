@@ -10,7 +10,9 @@
   import BackgroundTasksBar from "./lib/components/BackgroundTasksBar.svelte";
   import TerminalPanel from "./lib/components/TerminalPanel.svelte";
   import NetworkBanner from "./lib/components/NetworkBanner.svelte";
+  import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import { network } from "./lib/network.svelte";
+  import { updater } from "./lib/updater.svelte";
   import { app } from "./lib/stores.svelte";
   import { dashActions } from "./lib/stores.svelte";
   import { palette, type PaletteAction } from "./lib/palette.svelte";
@@ -49,6 +51,10 @@
       await hosts.refresh();
       // Seed the tray with the current state.
       api.refreshTray().catch(() => {});
+
+      // Fire-and-forget update check — the banner appears only if one's available.
+      // A delay keeps us out of the launch critical path on slow networks.
+      setTimeout(() => { void updater.check(); }, 3000);
 
       // On network reconnect, re-run every status probe immediately. The 30s
       // background poll continues as a safety net but this makes the UI
@@ -221,6 +227,8 @@
 </script>
 
 <svelte:window onkeydown={onKey} />
+
+<UpdateBanner />
 
 <div class="h-full flex border-t border-border">
   <Sidebar />
