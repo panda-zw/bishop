@@ -1,6 +1,6 @@
 [package]
 name = "deploy-app"
-version = "0.1.1"
+version = "0.1.2"
 description = "Desktop companion for ./deploy CLI"
 edition = "2021"
 rust-version = "1.77"
