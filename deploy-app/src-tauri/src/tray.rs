@@ -32,18 +32,76 @@ use crate::commands::hosts;
 use crate::config::{project, store};
 use std::path::PathBuf;
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem, Submenu, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager,
 };
 
+/// Source PNG for the tray icon — embedded at compile time so runtime has no
+/// filesystem dependency. Same art as the app icon; the rounding/resize pass
+/// below makes it read well at macOS menubar sizes (18–22 px).
+const TRAY_ICON_PNG: &[u8] = include_bytes!("../icons/128x128.png");
+
+/// Resize + circular-ish mask. The corner radius is ~42% of the side which
+/// reads as near-circular at 22 px (menubar) and still shows a hint of square
+/// at larger zoom levels (Windows/Linux where tray icons can be 32+ px).
+fn rounded_tray_icon() -> Result<Image<'static>, Box<dyn std::error::Error>> {
+    const TARGET: u32 = 44;
+    const RADIUS_PCT: f32 = 0.42;
+
+    let decoded = image::load_from_memory_with_format(TRAY_ICON_PNG, image::ImageFormat::Png)?
+        .resize_exact(TARGET, TARGET, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+
+    let mut pixels = decoded.into_raw();
+    let radius = (TARGET as f32 * RADIUS_PCT).round();
+    let r2 = radius * radius;
+
+    // Squared-distance test against the four corner circles. Pixels outside
+    // the rounded-rect union have alpha zeroed; interior pixels keep their
+    // original alpha so anti-aliased edges of the source PNG still blend.
+    for y in 0..TARGET {
+        for x in 0..TARGET {
+            let (fx, fy) = (x as f32, y as f32);
+            let (far_x, far_y) = ((TARGET - 1 - x) as f32, (TARGET - 1 - y) as f32);
+
+            let cx = if fx < radius { radius - fx } else if far_x < radius { radius - far_x } else { 0.0 };
+            let cy = if fy < radius { radius - fy } else if far_y < radius { radius - far_y } else { 0.0 };
+
+            if cx > 0.0 && cy > 0.0 {
+                let d2 = cx * cx + cy * cy;
+                let idx = ((y * TARGET + x) * 4 + 3) as usize;
+                if d2 > r2 {
+                    pixels[idx] = 0;
+                } else {
+                    // One-pixel band near the edge gets softened so the mask
+                    // doesn't produce visible stair-step aliasing.
+                    let d = d2.sqrt();
+                    if d > radius - 1.0 {
+                        let t = (radius - d).clamp(0.0, 1.0);
+                        pixels[idx] = ((pixels[idx] as f32) * t) as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Image::new_owned(pixels, TARGET, TARGET))
+}
+
 /// Build the tray on app setup. Registers a tray with id "main" and initial menu.
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let menu = build_menu(app)?;
 
+    // Fall back to the window icon if rounding fails — better a square icon
+    // than no tray at all.
+    let icon = rounded_tray_icon()
+        .unwrap_or_else(|_| app.default_window_icon().cloned().unwrap());
+
     TrayIconBuilder::with_id("main")
         .tooltip("Bishop")
-        .icon(app.default_window_icon().cloned().unwrap())
+        .icon(icon)
         .menu(&menu)
         .on_menu_event(|app, event| dispatch_event(app, event.id.as_ref()))
         .on_tray_icon_event(|tray, event| {
