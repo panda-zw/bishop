@@ -15,3 +15,4 @@ pub mod scrollback;
 pub mod scaffold;
 pub mod ssh_test;
 pub mod sample;
+pub mod paste;

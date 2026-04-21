@@ -58,6 +58,10 @@ export const api = {
     invoke<SshTestResult>("test_ssh", { user, host }),
   cloneSample: (destParent: string, folderName: string) =>
     invoke<string>("clone_sample", { destParent, folderName }),
+  pasteFileLocal: (data: string, filename: string) =>
+    invoke<string>("paste_file_local", { data, filename }),
+  pasteFileRemote: (target: TerminalTarget, data: string, filename: string) =>
+    invoke<string>("paste_file_remote", { target, data, filename }),
   opStatus: () => invoke<{ installed: boolean; signed_in: boolean }>("op_status"),
   opRead: (reference: string) => invoke<string>("op_read", { reference }),
   initProject: (input: InitProjectInput) => invoke<Project>("init_project", { input }),

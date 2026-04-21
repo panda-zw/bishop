@@ -2,10 +2,12 @@
   import { onMount, onDestroy } from "svelte";
   import { Terminal } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
+  import { ImageAddon } from "@xterm/addon-image";
   import "@xterm/xterm/css/xterm.css";
   import { api } from "../api";
   import { terminals, type TerminalTab } from "../terminals.svelte";
   import { theme } from "../theme.svelte";
+  import { toast } from "../toast.svelte";
 
   interface Props { tab: TerminalTab; active: boolean }
   let { tab, active }: Props = $props();
@@ -15,6 +17,14 @@
   let fit: FitAddon | null = null;
   let ro: ResizeObserver | null = null;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let dropActive = $state(false);
+
+  /// Inline preview cap — emitting an iTerm2 escape for a 50 MB image can
+  /// stall xterm for seconds. The file still gets saved/uploaded at full size.
+  const MAX_INLINE_PREVIEW_BYTES = 5 * 1024 * 1024;
+  /// Drop/paste hard cap — matches the backend limit so we fail fast with a
+  /// readable toast instead of waiting on a long IPC round-trip.
+  const MAX_FILE_BYTES = 200 * 1024 * 1024;
 
   /// Scrollback ring buffer (raw bytes). Sent to disk periodically and on close.
   const MAX_BYTES = 256 * 1024;
@@ -99,6 +109,10 @@
     });
     fit = new FitAddon();
     term.loadAddon(fit);
+    // Inline image rendering for pasted/dropped images (iTerm2 + Sixel + Kitty).
+    // Dropping an image into the tab emits an iTerm2 escape after the file path
+    // so the user gets a visual confirmation above their command line.
+    try { term.loadAddon(new ImageAddon()); } catch {}
     term.open(container);
     fit.fit();
 
@@ -164,6 +178,12 @@
     ro.observe(container);
 
     saveHandle = setInterval(flushScrollback, 15000);
+
+    // Paste handler has to run at capture phase so it fires before xterm's
+    // internal textarea consumes the event. When the clipboard holds files,
+    // we preventDefault + stopPropagation and upload ourselves; otherwise we
+    // no-op and xterm's text-paste path runs as usual.
+    container.addEventListener("paste", handlePaste, { capture: true });
   }
 
   /// Debounced termResize RPC — ResizeObserver fires on every pixel during a
@@ -219,11 +239,128 @@
     } catch {}
   });
 
+  /// POSIX single-quote quoting — every path we write to the PTY goes through
+  /// this so filenames with spaces/specials reach the shell as a single arg.
+  function shellQuote(s: string): string {
+    return `'${s.split("'").join("'\\''")}'`;
+  }
+
+  function extToMime(name: string): string {
+    const ext = name.split(".").pop()?.toLowerCase() ?? "";
+    if (ext === "png") return "image/png";
+    if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+    if (ext === "gif") return "image/gif";
+    if (ext === "webp") return "image/webp";
+    return "application/octet-stream";
+  }
+
+  /// Emit an iTerm2 inline-image escape into the LOCAL xterm (not the PTY).
+  /// The remote/local shell never sees this — only xterm's ImageAddon renders
+  /// it, giving the user a thumbnail preview above their typed command.
+  function previewImageLocally(name: string, bytes: Uint8Array) {
+    if (!term || bytes.length > MAX_INLINE_PREVIEW_BYTES) return;
+    const b64Name = btoa(unescape(encodeURIComponent(name)));
+    const b64Data = bytesToB64(bytes);
+    const esc =
+      `\x1b]1337;File=name=${b64Name};size=${bytes.length};` +
+      `inline=1;height=auto;width=auto;preserveAspectRatio=1:${b64Data}\x07\r\n`;
+    term.write(esc);
+  }
+
+  /// Types `paths` into the PTY as space-separated shell-quoted args. No
+  /// trailing newline — the user reviews and presses Enter themselves.
+  function typePathsIntoShell(paths: string[]) {
+    const active = terminals.byId(tab.id);
+    if (!active?.streamId) return;
+    const encoder = new TextEncoder();
+    const joined = paths.map(shellQuote).join(" ");
+    const bytes = encoder.encode(joined);
+    api.termWrite(active.streamId, bytesToB64(bytes)).catch((e) => console.error("type", e));
+  }
+
+  /// Core pipeline — invoked by both drop and paste. For each file: size
+  /// check, backend upload, preview if image, finally type the resulting
+  /// paths into the PTY.
+  async function processFiles(files: File[]) {
+    if (files.length === 0) return;
+    const paths: string[] = [];
+    for (const file of files) {
+      if (file.size > MAX_FILE_BYTES) {
+        toast.error(
+          `${file.name || "file"} too large`,
+          `${(file.size / 1_048_576).toFixed(1)} MB — limit is ${MAX_FILE_BYTES / 1_048_576} MB. scp it directly instead.`,
+        );
+        continue;
+      }
+      try {
+        const buf = new Uint8Array(await file.arrayBuffer());
+        const b64 = bytesToB64(buf);
+        const filename = file.name || "pasted.bin";
+        const path = tab.target.local
+          ? await api.pasteFileLocal(b64, filename)
+          : await api.pasteFileRemote(tab.target, b64, filename);
+        paths.push(path);
+
+        const mime = file.type || extToMime(filename);
+        if (mime.startsWith("image/")) {
+          previewImageLocally(filename, buf);
+        }
+        toast.success("Saved", path);
+      } catch (e) {
+        toast.error("Upload failed", String(e));
+      }
+    }
+    if (paths.length > 0) typePathsIntoShell(paths);
+  }
+
+  function handleDragOver(e: DragEvent) {
+    if (!e.dataTransfer) return;
+    // Only claim the event when actual files are being dragged — plain
+    // text/URL drags stay with xterm's default behavior.
+    const hasFiles = Array.from(e.dataTransfer.items).some(i => i.kind === "file");
+    if (!hasFiles) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    dropActive = true;
+  }
+
+  function handleDragLeave(e: DragEvent) {
+    // Fires when the pointer leaves the entire pane, not child elements.
+    if (e.currentTarget === e.target) dropActive = false;
+  }
+
+  async function handleDrop(e: DragEvent) {
+    dropActive = false;
+    if (!e.dataTransfer) return;
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+    e.preventDefault();
+    await processFiles(files);
+  }
+
+  async function handlePaste(e: ClipboardEvent) {
+    if (!e.clipboardData) return;
+    const files: File[] = [];
+    for (const item of Array.from(e.clipboardData.items)) {
+      if (item.kind === "file") {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length === 0) return;
+    // Only swallow the paste when files are present — regular text-paste
+    // continues to flow into xterm normally.
+    e.preventDefault();
+    e.stopPropagation();
+    await processFiles(files);
+  }
+
   onMount(() => { init(); });
   onDestroy(() => {
     if (ro) ro.disconnect();
     if (saveHandle) clearInterval(saveHandle);
     if (resizeTimer) clearTimeout(resizeTimer);
+    if (container) container.removeEventListener("paste", handlePaste, { capture: true } as EventListenerOptions);
     // Detach Tauri listeners so they don't fire into a disposed xterm.
     // The backend PTY stays alive — only `terminals.closeTab` kills it.
     const current = terminals.byId(tab.id);
@@ -236,6 +373,19 @@
   });
 </script>
 
-<div class="h-full w-full modal-sunken p-2" class:hidden={!active}>
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+  class="relative h-full w-full modal-sunken p-2"
+  class:hidden={!active}
+  class:drop-active={dropActive}
+  ondragover={handleDragOver}
+  ondragleave={handleDragLeave}
+  ondrop={handleDrop}
+>
   <div bind:this={container} class="h-full w-full"></div>
+  {#if dropActive}
+    <div class="pointer-events-none absolute inset-2 rounded-md border-2 border-dashed border-accent bg-accent/10 flex items-center justify-center">
+      <span class="text-sm text-accent font-medium">Drop to {tab.target.local ? "save locally" : "upload to remote"}</span>
+    </div>
+  {/if}
 </div>
